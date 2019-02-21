@@ -82,6 +82,7 @@ class Quantizer(object):
             The patterns are evaluated eagerly - the first match wins. Therefore, the more specific patterns must
             come before the broad patterns.
         quantize_bias (bool): Flag indicating whether to quantize bias (w. same number of bits as weights) or not.
+        bias_bits (bool): Number of bits used for quantization of bias
         train_with_fp_copy (bool): If true, will modify layers with weights to keep both a quantized and
             floating-point copy, such that the following flow occurs in each training iteration:
             1. q_weights = quantize(fp_weights)
@@ -92,7 +93,7 @@ class Quantizer(object):
             4. Update fp_weights with gradients calculated in step 3.2
     """
     def __init__(self, model, optimizer=None, bits_activations=None, bits_weights=None, bits_overrides=None,
-                 quantize_bias=False, train_with_fp_copy=False):
+                 quantize_bias=False, bits_bias=32, train_with_fp_copy=False):
         if bits_overrides is None:
             bits_overrides = OrderedDict()
         if not isinstance(bits_overrides, OrderedDict):
@@ -103,7 +104,8 @@ class Quantizer(object):
 
         self.default_qbits = QBits(acts=bits_activations, wts=bits_weights)
         self.quantize_bias = quantize_bias
-
+        self.bits_bias = bits_bias
+        
         self.model = model
         self.optimizer = optimizer
 
@@ -112,6 +114,7 @@ class Quantizer(object):
                                          'params': {'bits_activations': bits_activations,
                                                     'bits_weights': bits_weights,
                                                     'bits_overrides': copy.deepcopy(bits_overrides),
+                                                    'bits_bias' : bits_bias,
                                                     'quantize_bias': quantize_bias}}
 
         for k, v in bits_overrides.items():
@@ -153,7 +156,7 @@ class Quantizer(object):
         self.params_to_quantize = []
 
     def _add_qbits_entry(self, module_name, module_type, qbits):
-        if module_type not in [nn.Conv2d, nn.Linear, nn.Embedding]:
+        if module_type not in [nn.Conv1d, nn.Conv2d, nn.Linear, nn.Embedding]:
             # For now we support weights quantization only for Conv, FC and Embedding layers (so, for example, we don't
             # support quantization of batch norm scale parameters)
             qbits = QBits(acts=qbits.acts, wts=None)
@@ -186,7 +189,7 @@ class Quantizer(object):
                 if param_name.endswith('bias'):
                     if not self.quantize_bias:
                         continue
-                    n_bits = 32
+                    n_bits = self.bits_bias
                 fp_attr_name = param_name
                 if self.train_with_fp_copy:
                     hack_float_backup_parameter(module, param_name, n_bits)

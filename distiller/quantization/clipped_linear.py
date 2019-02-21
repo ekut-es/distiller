@@ -215,3 +215,38 @@ class PACTQuantizer(Quantizer):
         if self.act_clip_decay is not None:
             clip_val_group['weight_decay'] = self.act_clip_decay
         return [base_group, clip_val_group]
+
+
+
+class SignedFixpointQuantizer(Quantizer):
+    """
+    Quantizer using traditional fixpoint quantization for weights and biases:
+    
+    1.  Clip values to [-1, 1 - (1 / 2^(k-1))]
+    2.  Quantize to using round(v * 2^(k-1))
+
+    """
+    def __init__(self, model, optimizer, bits_activations=32, bits_weights=32, bits_overrides=None,
+                 quantize_bias=False, bits_bias=32):
+        super(SignedFixpointQuantizer, self).__init__(model, optimizer=optimizer, bits_activations=bits_activations,
+                                            bits_weights=bits_weights, bits_overrides=bits_overrides,
+                                            train_with_fp_copy=True, quantize_bias=quantize_bias,
+                                            bits_bias=bits_bias)
+
+        def fixpoint_quantize_param(param_fp, param_meta):
+            scale, zero_point = symmetric_linear_quantization_params(param_meta.num_bits,
+                                                                     2^(bits_weights-1))
+
+            out = param_fp.clamp(-1.0, 1.0 - (1.0 / 2.0**(bits_weights-1)))
+            out = LinearQuantizeSTE.apply(out, scale, zero_point, True, False)
+            return out
+
+        def relu_replace_fn(module, name, qbits_map):
+            bits_acts = qbits_map[name].acts
+            if bits_acts is None:
+                return module
+            return ClippedLinearQuantization(bits_acts, 1-(1/(2**(bits_activations-1))), dequantize=True, inplace=module.inplace)
+
+        self.param_quantization_fn = fixpoint_quantize_param
+
+        self.replacement_factory[nn.ReLU] = relu_replace_fn
