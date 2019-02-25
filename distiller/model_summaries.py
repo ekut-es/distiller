@@ -155,12 +155,10 @@ def masks_sparsity_tbl_summary(model, scheduler, param_dims=[2, 4]):
 
 
 # Performance data collection  code follows from here down
-
 def conv_visitor(self, input, output, df, model, memo):
     assert isinstance(self, torch.nn.Conv2d) or isinstance(self, torch.nn.Conv1d)
     if self in memo:
         return
-
 
     weights_vol = self.out_channels * self.in_channels * distiller.volume(self.kernel_size)
 
@@ -185,6 +183,18 @@ def fc_visitor(self, input, output, df, model, memo):
     weights_vol = macs = self.in_features * self.out_features
     module_visitor(self, input, output, df, model, weights_vol, macs)
 
+def generic_visitor(self, input, output, df, model, memo):
+    if self in memo:
+        return
+
+    if len(list(self.children())) != 0:
+        return
+    
+    if isinstance(self, torch.nn.Dropout):
+        return
+    
+    weights_vol = macs = 0
+    module_visitor(self, input, output, df, model, weights_vol, macs)
 
 def module_visitor(self, input, output, df, model, weights_vol, macs, attrs=None):
     in_features_shape = input[0].size()
@@ -203,11 +213,14 @@ def model_performance_summary(model, dummy_input, batch_size=1):
     def install_perf_collector(m):
         if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Conv1d):
             hook_handles.append(m.register_forward_hook(
-                                    partial(conv_visitor, df=df, model=model, memo=memo)))
+                partial(conv_visitor, df=df, model=model, memo=memo)))
         elif isinstance(m, torch.nn.Linear):
             hook_handles.append(m.register_forward_hook(
-                                    partial(fc_visitor, df=df, model=model, memo=memo)))
-
+                partial(fc_visitor, df=df, model=model, memo=memo)))
+        else:
+            hook_handles.append(m.register_forward_hook(
+                partial(generic_visitor, df=df, model=model, memo=memo)))
+            
     df = pd.DataFrame(columns=['Name', 'Type', 'Attrs', 'IFM', 'IFM volume',
                                'OFM', 'OFM volume', 'Weights volume', 'MACs'])
 
