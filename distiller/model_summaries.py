@@ -157,17 +157,21 @@ def masks_sparsity_tbl_summary(model, scheduler, param_dims=[2, 4]):
 # Performance data collection  code follows from here down
 
 def conv_visitor(self, input, output, df, model, memo):
-    assert isinstance(self, torch.nn.Conv2d)
+    assert isinstance(self, torch.nn.Conv2d) or isinstance(self, torch.nn.Conv1d)
     if self in memo:
         return
 
-    weights_vol = self.out_channels * self.in_channels * self.kernel_size[0] * self.kernel_size[1]
+
+    weights_vol = self.out_channels * self.in_channels * distiller.volume(self.kernel_size)
 
     # Multiply-accumulate operations: MACs = volume(OFM) * (#IFM * K^2) / #Groups
     # Bias is ignored
     macs = (distiller.volume(output) *
-            (self.in_channels / self.groups * self.kernel_size[0] * self.kernel_size[1]))
+            (self.in_channels / self.groups * distiller.volume(self.kernel_size)))
+    macs /= distiller.volume(self.stride)
     attrs = 'k=' + '('+(', ').join(['%d' % v for v in self.kernel_size])+')'
+    attrs += ', s=' +'('+(', ').join(['%d' % v for v in self.stride])+')'
+    attrs += ', g=%d' % self.groups
     module_visitor(self, input, output, df, model, weights_vol, macs, attrs)
 
 
@@ -197,7 +201,7 @@ def module_visitor(self, input, output, df, model, weights_vol, macs, attrs=None
 def model_performance_summary(model, dummy_input, batch_size=1):
     """Collect performance data"""
     def install_perf_collector(m):
-        if isinstance(m, torch.nn.Conv2d):
+        if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Conv1d):
             hook_handles.append(m.register_forward_hook(
                                     partial(conv_visitor, df=df, model=model, memo=memo)))
         elif isinstance(m, torch.nn.Linear):
