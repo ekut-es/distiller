@@ -36,6 +36,7 @@ import distiller
 import logging
 msglogger = logging.getLogger(__name__)
 
+from torch.onnx import utils as onnx_utils
 
 def onnx_name_2_pytorch_name(name, op_type):
     # Convert a layer's name from an ONNX name, to a PyTorch name
@@ -95,50 +96,55 @@ class SummaryGraph(object):
 
     def __init__(self, model, dummy_input):
         model = distiller.make_non_parallel_copy(model)
-        with torch.onnx.set_training(model, False):
-            trace, _ = jit.get_trace_graph(model, dummy_input.cuda())
 
-            # Let ONNX do the heavy lifting: fusing the convolution nodes; fusing the nodes
-            # composing a GEMM operation; etc.
-            torch.onnx._optimize_trace(trace, False)
-            graph = trace.graph()
-            self.ops = {}
-            self.params = {}
-            self.edges = []
-            self.temp = {}
+        graph, params, torch_out = onnx_utils._model_to_graph(model, dummy_input, "",
+                                                             operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK)
+        self.ops = {}
+        self.tensors = params
+        self.params = {}
+        self.edges = []
+        self.temp = {}
 
-            in_out = list(graph.inputs()) + list(graph.outputs())
-            for param in in_out:
-                self.__add_param(param)
+        in_out = list(graph.inputs()) + list(graph.outputs())
+        for param in in_out:
+            self.__add_param(param)
 
-            for node in graph.nodes():
-                new_op = self.__create_op(node)
+        for node in graph.nodes():
+            new_op = self.__create_op(node)
 
-                # Operators with the same name create very confusing graphs (Resnet, for example),
-                # so we "unroll" them.
-                # Sometimes operations of different types have the same name, so we differentiate
-                # using both name and type
-                # (this happens, for example, when an operator is called via some functional API and
-                # not via a module)
+            # Operators with the same name create very confusing graphs (Resnet, for example),
+            # so we "unroll" them.
+            # Sometimes operations of different types have the same name, so we differentiate
+            # using both name and type
+            # (this happens, for example, when an operator is called via some functional API and
+            # not via a module)
+            new_op['name'] = onnx_name_2_pytorch_name(new_op['name'], new_op['type'])
+
+            new_name = new_op["name"]
+            same = [None]
+            count = 1
+            while len(same) > 0:
                 same = [op for op in self.ops.values() if
-                        op['orig-name'] + op['type'] == new_op['orig-name'] + new_op['type']]
+                        op['name'] == new_op['name']]
+
                 if len(same) > 0:
-                    new_op['name'] += "." + str(len(same))
+                    new_op['name'] = new_name + "." + str(count)
 
-                new_op['name'] = onnx_name_2_pytorch_name(new_op['name'], new_op['type'])
-                assert len(new_op['name']) > 0
+                count += 1             
 
-                self.ops[new_op['name']] = new_op
+            assert len(new_op['name']) > 0
 
-                for input_ in node.inputs():
-                    self.__add_input(new_op, input_)
-                    self.edges.append(SummaryGraph.Edge(input_.uniqueName(), new_op['name']))
+            self.ops[new_op['name']] = new_op
 
-                for output in node.outputs():
-                    self.__add_output(new_op, output)
-                    self.edges.append(SummaryGraph.Edge(new_op['name'], output.uniqueName()))
+            for input_ in node.inputs():
+                self.__add_input(new_op, input_)
+                self.edges.append(SummaryGraph.Edge(input_.uniqueName(), new_op['name']))
 
-                new_op['attrs'] = {attr_name: node[attr_name] for attr_name in node.attributeNames()}
+            for output in node.outputs():
+                self.__add_output(new_op, output)
+                self.edges.append(SummaryGraph.Edge(new_op['name'], output.uniqueName()))
+
+            new_op['attrs'] = {attr_name: node[attr_name] for attr_name in node.attributeNames()}
 
         self.add_macs_attr()
         self.add_footprint_attr()
@@ -181,10 +187,10 @@ class SummaryGraph(object):
         tensor = {}
         tensor['id'] = n.uniqueName()
         try:
-            # try parsing the FM tensor type.  For example: Float(1, 64, 8, 8)
-            s = str(n.type())
-            s = s[s.find('(')+1: s.find(')')]
-            tensor['shape'] = tuple(map(lambda x: int(x), s.split(',')))
+            tensor['shape'] = 0,
+            if n.isTensor():
+                tensor['shape'] = tuple(n.type().sizes())
+            
         except ValueError:
             # Size not specified in type
             tensor['shape'] = 0,
@@ -206,17 +212,22 @@ class SummaryGraph(object):
             if op['type'] == 'Conv':
                 conv_out = op['outputs'][0]
                 conv_in = op['inputs'][0]
-                conv_w = op['attrs']['kernel_shape']
+                conv_shape = op['attrs']['kernel_shape']
                 ofm_vol = self.param_volume(conv_out)
+                ifm_vol = self.param_volume(conv_in)
+                conv_vol = SummaryGraph.volume(conv_shape)
+                
                 # MACs = volume(OFM) * (#IFM * K^2)
-                op['attrs']['MACs'] = ofm_vol * SummaryGraph.volume(conv_w) * self.params[conv_in]['shape'][1]
+                op['attrs']['MACs'] = ofm_vol * ifm_vol * conv_vol
+                
             elif op['type'] == 'Gemm':
-                conv_out = op['outputs'][0]
-                conv_in = op['inputs'][0]
-                n_ifm = self.param_shape(conv_in)[1]
-                n_ofm = self.param_shape(conv_out)[1]
-                # MACs = #IFM * #OFM
-                op['attrs']['MACs'] = n_ofm * n_ifm
+                gemm_out = op['outputs'][0]
+                gemm_in = op['inputs'][0]
+                gemm_in_shape  = self.param_shape(conv_in)
+                gemm_out_shape = self.param_shape(conv_out)
+
+                # MACs = batch_size * input_vector_length * output_vector_length
+                op['attrs']['MACs'] = gemm_in_shape[0] * gemm_in_shape[1] * gemm_out_shape[1]
 
     def add_footprint_attr(self):
         for op in self.ops.values():
@@ -625,7 +636,7 @@ def export_img_classifier_to_onnx(model, onnx_fname, dataset, export_params=True
         torch.onnx.export(model, dummy_input, onnx_fname, verbose=False, export_params=export_params)
         msglogger.info('Exported the model to ONNX format at %s' % os.path.realpath(onnx_fname))
 
-
+    
 def data_node_has_parent(g, id):
     for edge in g.edges:
         if edge.dst == id:
