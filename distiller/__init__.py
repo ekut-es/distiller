@@ -24,13 +24,14 @@ from .directives import *
 from .policy import *
 from .thinning import *
 from .knowledge_distillation import KnowledgeDistillationPolicy, DistillationLossWeights
+from .summary_graph import SummaryGraph, onnx_name_2_pytorch_name
 
 
 del dict_config
 del thinning
 
 # Distiller version
-__version__ = "0.3.0-pre"
+__version__ = "0.4.0-pre"
 
 
 def model_find_param_name(model, param_to_find):
