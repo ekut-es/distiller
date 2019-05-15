@@ -91,7 +91,6 @@ class Quantizer(object):
             specific layers in that group, e.g. 'conv1'.
             The patterns are evaluated eagerly - the first match wins. Therefore, the more specific patterns must
             come before the broad patterns.
-        quantize_bias (bool): Flag indicating whether to quantize bias (w. same number of bits as weights) or not.
         train_with_fp_copy (bool): If true, will modify layers with weights to keep both a quantized and
             floating-point copy, such that the following flow occurs in each training iteration:
             1. q_weights = quantize(fp_weights)

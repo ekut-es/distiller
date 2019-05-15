@@ -228,12 +228,10 @@ class SignedFixpointQuantizer(Quantizer):
     2.  Quantize to using round(v * 2^(k-1))
 
     """
-    def __init__(self, model, optimizer, bits_activations=32, bits_weights=32, bits_overrides=None,
-                 quantize_bias=False, bits_bias=32):
+    def __init__(self, model, optimizer, bits_activations=32, bits_weights=32, overrides=None, bits_bias=32):
         super(SignedFixpointQuantizer, self).__init__(model, optimizer=optimizer, bits_activations=bits_activations,
-                                            bits_weights=bits_weights, bits_overrides=bits_overrides,
-                                            train_with_fp_copy=True, quantize_bias=quantize_bias,
-                                            bits_bias=bits_bias)
+                                                      bits_weights=bits_weights, bits_bias=bits_bias,
+                                                      train_with_fp_copy=True, overrides=overrides)
 
         def fixpoint_quantize_param(param_fp, param_meta):
             scale, zero_point = symmetric_linear_quantization_params(param_meta.num_bits,
