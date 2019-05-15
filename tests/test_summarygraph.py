@@ -16,16 +16,14 @@
 
 import logging
 import torch
-import os
-import sys
 import pytest
-module_path = os.path.abspath(os.path.join('..'))
-if module_path not in sys.path:
-    sys.path.append(module_path)
 import distiller
-from models import ALL_MODEL_NAMES, create_model
-from apputils import *
-from distiller import normalize_module_name, denormalize_module_name
+from distiller.models import ALL_MODEL_NAMES, create_model
+from distiller.apputils import *
+from distiller import normalize_module_name, denormalize_module_name, \
+    SummaryGraph, onnx_name_2_pytorch_name
+from distiller.model_summaries import connectivity_summary, connectivity_summary_verbose
+
 
 # Logging configuration
 logging.basicConfig(level=logging.DEBUG)
@@ -61,7 +59,7 @@ def test_connectivity():
     assert g is not None
 
     op_names = [op['name'] for op in g.ops.values()]
-    assert 73 == len(op_names)
+    assert 81 == len(op_names)
 
     edges = g.edges
     assert edges[0].src == '0' and edges[0].dst == 'conv1'
@@ -69,15 +67,10 @@ def test_connectivity():
     # Test two sequential calls to predecessors (this was a bug once)
     preds = g.predecessors(g.find_op('bn1'), 1)
     preds = g.predecessors(g.find_op('bn1'), 1)
-    assert preds == ['108', '2', '3', '4', '5']
+    assert preds == ['129', '2', '3', '4', '5']
     # Test successors
     succs = g.successors(g.find_op('bn1'), 2)
     assert succs == ['relu']
-
-    op = g.find_op('layer1.0')
-    assert op is not None
-    preds = g.predecessors(op, 2)
-    assert preds == ['layer1.0.bn2', 'relu']
 
     op = g.find_op('layer1.0.relu2')
     assert op is not None
@@ -168,6 +161,22 @@ def test_normalize_module_name():
     name_test('imagenet', 'alexnet')
 
 
+def named_params_layers_test_aux(dataset, arch, dataparallel:bool):
+    model = create_model(False, dataset, arch, parallel=dataparallel)
+    sgraph = SummaryGraph(model, get_input(dataset))
+    sgraph_layer_names = set(k for k, i, j in sgraph.named_params_layers())
+    for layer_name in sgraph_layer_names:
+        assert sgraph.find_op(layer_name) is not None, '{} was not found in summary graph'.format(layer_name)
+
+
+def test_named_params_layers():
+    for dataParallelModel in (True, False):
+        named_params_layers_test_aux('imagenet', 'vgg19', dataParallelModel)
+        named_params_layers_test_aux('cifar10', 'resnet20_cifar', dataParallelModel)
+        named_params_layers_test_aux('imagenet', 'alexnet', dataParallelModel)
+        named_params_layers_test_aux('imagenet', 'resnext101_32x4d', dataParallelModel)
+
+
 def test_onnx_name_2_pytorch_name():
     assert "layer3.0.relu1" == onnx_name_2_pytorch_name("ResNet/Sequential[layer3]/BasicBlock[0]/ReLU[relu].1", 'Relu')
     assert "features.34" == onnx_name_2_pytorch_name('VGG/[features]/Sequential/Conv2d[34]', 'Conv')
@@ -180,11 +189,28 @@ def test_connectivity_summary():
     assert g is not None
 
     summary = connectivity_summary(g)
-    assert len(summary) == 73
+    assert len(summary) == 81
 
     verbose_summary = connectivity_summary_verbose(g)
-    assert len(verbose_summary) == 73
+    assert len(verbose_summary) == 81
 
+
+def test_sg_macs():
+    '''Compare the MACs of different modules as computed by a SummaryGraph
+    and model summary.'''
+    import common
+    sg = create_graph('imagenet', 'mobilenet')
+    assert sg
+    model, _ = common.setup_test('mobilenet', 'imagenet', parallel=False)
+    df_compute = distiller.model_performance_summary(model, common.get_dummy_input('imagenet'))
+    modules_macs = df_compute.loc[:, ['Name', 'MACs']]
+    for name, mod in model.named_modules():
+        if isinstance(mod, (torch.nn.Conv2d, torch.nn.Linear)):
+            summary_macs = int(modules_macs.loc[modules_macs.Name == name].MACs)
+            sg_macs = sg.find_op(name)['attrs']['MACs']
+            assert summary_macs == sg_macs
+ 
 
 if __name__ == '__main__':
-    test_connectivity_summary()
+    #test_connectivity_summary()
+    test_sg_macs()

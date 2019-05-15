@@ -39,6 +39,7 @@ train():
         loss = criterion(output, target)
         compression_scheduler.before_backward_pass(epoch)
         loss.backward()
+        compression_scheduler.before_parameter_optimization(epoch)
         optimizer.step()
         compression_scheduler.on_minibatch_end(epoch)
 
@@ -53,8 +54,6 @@ models, or with the provided sample models:
 import math
 import time
 import os
-import sys
-import random
 import traceback
 import logging
 from collections import OrderedDict
@@ -67,19 +66,15 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torchnet.meter as tnt
-script_dir = os.path.dirname(__file__)
-module_path = os.path.abspath(os.path.join(script_dir, '..', '..'))
-try:
-    import distiller
-except ImportError:
-    sys.path.append(module_path)
-    import distiller
-import apputils
+import distiller
+import distiller.apputils as apputils
+import distiller.model_summaries as model_summaries
 from distiller.data_loggers import *
 import distiller.quantization as quantization
 import examples.automated_deep_compression as adc
-from models import ALL_MODEL_NAMES, create_model
+from distiller.models import ALL_MODEL_NAMES, create_model
 import parser
+import operator
 
 
 # Logger handle
@@ -87,10 +82,14 @@ msglogger = None
 
 
 def main():
+    script_dir = os.path.dirname(__file__)
+    module_path = os.path.abspath(os.path.join(script_dir, '..', '..'))
     global msglogger
 
     # Parse arguments
     args = parser.get_parser().parse_args()
+    if args.epochs is None:
+        args.epochs = 90
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
@@ -98,27 +97,23 @@ def main():
 
     # Log various details about the execution environment.  It is sometimes useful
     # to refer to past experiment executions and this information may be useful.
-    apputils.log_execution_env_state(args.compress,
-        msglogger.logdir, gitroot=module_path)
+    apputils.log_execution_env_state(args.compress, msglogger.logdir, gitroot=module_path)
     msglogger.debug("Distiller: %s", distiller.__version__)
 
     start_epoch = 0
-    best_epochs = [distiller.MutableNamedTuple({'epoch': 0, 'top1': 0, 'sparsity': 0})
-                   for i in range(args.num_best_scores)]
+    ending_epoch = args.epochs
+    perf_scores_history = []
 
+    if args.evaluate:
+        args.deterministic = True
     if args.deterministic:
         # Experiment reproducibility is sometimes important.  Pete Warden expounded about this
         # in his blog: https://petewarden.com/2018/03/19/the-machine-learning-reproducibility-crisis/
-        # In Pytorch, support for deterministic execution is still a bit clunky.
-        if args.workers > 1:
-            msglogger.error('ERROR: Setting --deterministic requires setting --workers/-j to 0 or 1')
-            exit(1)
-        # Use a well-known seed, for repeatability of experiments
-        distiller.set_deterministic()
+        distiller.set_deterministic()  # Use a well-known seed, for repeatability of experiments
     else:
-        # This issue: https://github.com/pytorch/pytorch/issues/3659
-        # Implies that cudnn.benchmark should respect cudnn.deterministic, but empirically we see that
-        # results are not re-produced when benchmark is set. So enabling only if deterministic mode disabled.
+        # Turn on CUDNN benchmark mode for best performance. This is usually "safe" for image
+        # classification models, as the input sizes don't change during the run
+        # See here: https://discuss.pytorch.org/t/what-does-torch-backends-cudnn-benchmark-do/5936/3
         cudnn.benchmark = True
 
     if args.cpu or not torch.cuda.is_available():
@@ -131,14 +126,12 @@ def main():
             try:
                 args.gpus = [int(s) for s in args.gpus.split(',')]
             except ValueError:
-                msglogger.error('ERROR: Argument --gpus must be a comma-separated list of integers only')
-                exit(1)
+                raise ValueError('ERROR: Argument --gpus must be a comma-separated list of integers only')
             available_gpus = torch.cuda.device_count()
             for dev_id in args.gpus:
                 if dev_id >= available_gpus:
-                    msglogger.error('ERROR: GPU device ID {0} requested, but only {1} devices available'
-                                    .format(dev_id, available_gpus))
-                    exit(1)
+                    raise ValueError('ERROR: GPU device ID {0} requested, but only {1} devices available'
+                                     .format(dev_id, available_gpus))
             # Set default device in case the first one on the list != 0
             torch.cuda.set_device(args.gpus[0])
 
@@ -165,19 +158,36 @@ def main():
     if args.earlyexit_thresholds:
         msglogger.info('=> using early-exit threshold values of %s', args.earlyexit_thresholds)
 
-    # We can optionally resume from a checkpoint
-    if args.resume:
-        model, compression_scheduler, start_epoch = apputils.load_checkpoint(model, chkpt_file=args.resume)
-        model.to(args.device)
+    # TODO(barrh): args.deprecated_resume is deprecated since v0.3.1
+    if args.deprecated_resume:
+        msglogger.warning('The "--resume" flag is deprecated. Please use "--resume-from=YOUR_PATH" instead.')
+        if not args.reset_optimizer:
+            msglogger.warning('If you wish to also reset the optimizer, call with: --reset-optimizer')
+            args.reset_optimizer = True
+        args.resumed_checkpoint_path = args.deprecated_resume
 
-    # Define loss function (criterion) and optimizer
+    # We can optionally resume from a checkpoint
+    optimizer = None
+    if args.resumed_checkpoint_path:
+        model, compression_scheduler, optimizer, start_epoch = apputils.load_checkpoint(
+            model, args.resumed_checkpoint_path, model_device=args.device)
+    elif args.load_model_path:
+        model = apputils.load_lean_checkpoint(model, args.load_model_path,
+                                              model_device=args.device)
+    if args.reset_optimizer:
+        start_epoch = 0
+        if optimizer is not None:
+            optimizer = None
+            msglogger.info('\nreset_optimizer flag set: Overriding resumed optimizer and resetting epoch count to 0')
+
+    # Define loss function (criterion)
     criterion = nn.CrossEntropyLoss().to(args.device)
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr,
-                                momentum=args.momentum,
-                                weight_decay=args.weight_decay)
-    msglogger.info('Optimizer Type: %s', type(optimizer))
-    msglogger.info('Optimizer Args: %s', optimizer.defaults)
+    if optimizer is None:
+        optimizer = torch.optim.SGD(model.parameters(),
+            lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+        msglogger.info('Optimizer Type: %s', type(optimizer))
+        msglogger.info('Optimizer Args: %s', optimizer.defaults)
 
     if args.AMC:
         return automated_deep_compression(model, criterion, optimizer, pylogger, args)
@@ -221,7 +231,8 @@ def main():
     if args.compress:
         # The main use-case for this sample application is CNN compression. Compression
         # requires a compression schedule configuration file in YAML.
-        compression_scheduler = distiller.file_config(model, optimizer, args.compress, compression_scheduler)
+        compression_scheduler = distiller.file_config(model, optimizer, args.compress, compression_scheduler,
+            (start_epoch-1) if args.resumed_checkpoint_path else None)
         # Model is re-transferred to GPU in case parameters were added (e.g. PACTQuantizer)
         model.to(args.device)
     elif compression_scheduler is None:
@@ -229,10 +240,12 @@ def main():
 
     if args.thinnify:
         #zeros_mask_dict = distiller.create_model_masks_dict(model)
-        assert args.resume is not None, "You must use --resume to provide a checkpoint file to thinnify"
+        assert args.resumed_checkpoint_path is not None, \
+            "You must use --resume-from to provide a checkpoint file to thinnify"
         distiller.remove_filters(model, compression_scheduler.zeros_mask_dict, args.arch, args.dataset, optimizer=None)
         apputils.save_checkpoint(0, args.arch, model, optimizer=None, scheduler=compression_scheduler,
-                                 name="{}_thinned".format(args.resume.replace(".pth.tar", "")), dir=msglogger.logdir)
+                                 name="{}_thinned".format(args.resumed_checkpoint_path.replace(".pth.tar", "")),
+                                 dir=msglogger.logdir)
         print("Note: your model may have collapsed to random inference, so you may want to fine-tune")
         return
 
@@ -240,7 +253,7 @@ def main():
     if args.kd_teacher:
         teacher = create_model(args.kd_pretrained, args.dataset, args.kd_teacher, device_ids=args.gpus)
         if args.kd_resume:
-            teacher, _, _ = apputils.load_checkpoint(teacher, chkpt_file=args.kd_resume)
+            teacher = apputils.load_lean_checkpoint(teacher, args.kd_resume)
         dlw = distiller.DistillationLossWeights(args.kd_distill_wt, args.kd_student_wt, args.kd_teacher_wt)
         args.kd_policy = distiller.KnowledgeDistillationPolicy(model, teacher, args.kd_temp, dlw)
         compression_scheduler.add_policy(args.kd_policy, starting_epoch=args.kd_start_epoch, ending_epoch=args.epochs,
@@ -253,11 +266,17 @@ def main():
                        ' | '.join(['{:.2f}'.format(val) for val in dlw]))
         msglogger.info('\tStarting from Epoch: %s', args.kd_start_epoch)
 
-    for epoch in range(start_epoch, start_epoch + args.epochs):
+    if start_epoch >= ending_epoch:
+        msglogger.error(
+            'epoch count is too low, starting epoch is {} but total epochs set to {}'.format(
+            start_epoch, ending_epoch))
+        raise ValueError('Epochs parameter is too low. Nothing to do.')
+    for epoch in range(start_epoch, ending_epoch):
         # This is the main training loop.
         msglogger.info('\n')
         if compression_scheduler:
-            compression_scheduler.on_epoch_begin(epoch)
+            compression_scheduler.on_epoch_begin(epoch,
+                metrics=(vloss if (epoch != start_epoch) else 10**6))
 
         # Train for one epoch
         with collectors_context(activations_collectors["train"]) as collectors:
@@ -276,7 +295,7 @@ def main():
                                                 collector=collectors["sparsity"])
             save_collectors_data(collectors, msglogger.logdir)
 
-        stats = ('Peformance/Validation/',
+        stats = ('Performance/Validation/',
                  OrderedDict([('Loss', vloss),
                               ('Top1', top1),
                               ('Top5', top5)]))
@@ -287,17 +306,13 @@ def main():
             compression_scheduler.on_epoch_end(epoch, optimizer)
 
         # Update the list of top scores achieved so far, and save the checkpoint
-        is_best = top1 > best_epochs[-1].top1
-        if top1 > best_epochs[0].top1:
-            best_epochs[0].epoch = epoch
-            best_epochs[0].top1 = top1
-            # Keep best_epochs sorted such that best_epochs[0] is the lowest top1 in the best_epochs list
-            best_epochs = sorted(best_epochs, key=lambda score: score.top1)
-        for score in reversed(best_epochs):
-            if score.top1 > 0:
-                msglogger.info('==> Best Top1: %.3f on Epoch: %d', score.top1, score.epoch)
-        apputils.save_checkpoint(epoch, args.arch, model, optimizer, compression_scheduler,
-                                 best_epochs[-1].top1, is_best, args.name, msglogger.logdir)
+        update_training_scores_history(perf_scores_history, model, top1, top5, epoch, args.num_best_scores)
+        is_best = epoch == perf_scores_history[0].epoch
+        checkpoint_extras = {'current_top1': top1,
+                             'best_top1': perf_scores_history[0].top1,
+                             'best_epoch': perf_scores_history[0].epoch}
+        apputils.save_checkpoint(epoch, args.arch, model, optimizer=optimizer, scheduler=compression_scheduler,
+                                 extras=checkpoint_extras, is_best=is_best, name=args.name, dir=msglogger.logdir)
 
     # Finally run results on the test set
     test(test_loader, model, criterion, [pylogger], activations_collectors, args=args)
@@ -331,8 +346,8 @@ def train(train_loader, model, criterion, optimizer, epoch,
 
     # Switch to train mode
     model.train()
+    acc_stats = []
     end = time.time()
-
     for train_step, (inputs, target) in enumerate(train_loader):
         # Measure data loading time
         data_time.add(time.time() - end)
@@ -349,12 +364,13 @@ def train(train_loader, model, criterion, optimizer, epoch,
 
         if not args.earlyexit_lossweights:
             loss = criterion(output, target)
-            # Measure accuracy and record loss
+            # Measure accuracy
             classerr.add(output.data, target)
+            acc_stats.append([classerr.value(1), classerr.value(5)])
         else:
             # Measure accuracy and record loss
             loss = earlyexit_loss(output, target, criterion, args)
-
+        # Record loss
         losses[OBJECTIVE_LOSS_KEY].add(loss.item())
 
         if compression_scheduler:
@@ -375,6 +391,8 @@ def train(train_loader, model, criterion, optimizer, epoch,
         # Compute the gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
+        if compression_scheduler:
+            compression_scheduler.before_parameter_optimization(epoch, train_step, steps_per_epoch, optimizer)
         optimizer.step()
         if compression_scheduler:
             compression_scheduler.on_minibatch_end(epoch, train_step, steps_per_epoch, optimizer)
@@ -401,7 +419,7 @@ def train(train_loader, model, criterion, optimizer, epoch,
             stats_dict.update(errs)
             stats_dict['LR'] = optimizer.param_groups[0]['lr']
             stats_dict['Time'] = batch_time.mean
-            stats = ('Peformance/Training/', stats_dict)
+            stats = ('Performance/Training/', stats_dict)
 
             params = model.named_parameters() if args.log_params_histograms else None
             distiller.log_training_progress(stats,
@@ -410,6 +428,7 @@ def train(train_loader, model, criterion, optimizer, epoch,
                                             steps_per_epoch, args.print_freq,
                                             loggers)
         end = time.time()
+    return acc_stats
 
 
 def validate(val_loader, model, criterion, loggers, args, epoch=-1):
@@ -517,6 +536,21 @@ def _validate(data_loader, model, criterion, loggers, args, epoch=-1):
         return total_top1, total_top5, losses_exits_stats[args.num_exits-1]
 
 
+def update_training_scores_history(perf_scores_history, model, top1, top5, epoch, num_best_scores):
+    """ Update the list of top training scores achieved so far, and log the best scores so far"""
+
+    model_sparsity, _, params_nnz_cnt = distiller.model_params_stats(model)
+    perf_scores_history.append(distiller.MutableNamedTuple({'params_nnz_cnt': -params_nnz_cnt,
+                                                            'sparsity': model_sparsity,
+                                                            'top1': top1, 'top5': top5, 'epoch': epoch}))
+    # Keep perf_scores_history sorted from best to worst
+    # Sort by sparsity as main sort key, then sort by top1, top5 and epoch
+    perf_scores_history.sort(key=operator.attrgetter('params_nnz_cnt', 'top1', 'top5', 'epoch'), reverse=True)
+    for score in perf_scores_history[:num_best_scores]:
+        msglogger.info('==> Best [Top1: %.3f   Top5: %.3f   Sparsity:%.2f   Params: %d on epoch: %d]',
+                       score.top1, score.top5, score.sparsity, -score.params_nnz_cnt, score.epoch)
+
+
 def earlyexit_loss(output, target, criterion, args):
     loss = 0
     sum_lossweights = 0
@@ -595,7 +629,7 @@ def evaluate_model(model, criterion, test_loader, loggers, activations_collector
     # the test dataset.
     # You can optionally quantize the model to 8-bit integer before evaluation.
     # For example:
-    # python3 compress_classifier.py --arch resnet20_cifar  ../data.cifar10 -p=50 --resume=checkpoint.pth.tar --evaluate
+    # python3 compress_classifier.py --arch resnet20_cifar  ../data.cifar10 -p=50 --resume-from=checkpoint.pth.tar --evaluate
 
     if not isinstance(loggers, list):
         loggers = [loggers]
@@ -610,16 +644,16 @@ def evaluate_model(model, criterion, test_loader, loggers, activations_collector
 
     if args.quantize_eval:
         checkpoint_name = 'quantized'
-        apputils.save_checkpoint(0, args.arch, model, optimizer=None, best_top1=top1, scheduler=scheduler,
+        apputils.save_checkpoint(0, args.arch, model, optimizer=None, scheduler=scheduler,
                                  name='_'.join([args.name, checkpoint_name]) if args.name else checkpoint_name,
-                                 dir=msglogger.logdir)
+                                 dir=msglogger.logdir, extras={'quantized_top1': top1})
 
 
 def summarize_model(model, dataset, which_summary):
     if which_summary.startswith('png'):
-        apputils.draw_img_classifier_to_file(model, 'model.png', dataset, which_summary == 'png_w_params')
+        model_summaries.draw_img_classifier_to_file(model, 'model.png', dataset, which_summary == 'png_w_params')
     elif which_summary == 'onnx':
-        apputils.export_img_classifier_to_onnx(model, 'model.onnx', dataset)
+        model_summaries.export_img_classifier_to_onnx(model, 'model.onnx', dataset)
     else:
         distiller.model_summary(model, which_summary, dataset)
 
@@ -730,11 +764,12 @@ def save_collectors_data(collectors, directory):
 
 
 def check_pytorch_version():
-    if torch.__version__ < '0.4.0':
+    from pkg_resources import parse_version
+    if parse_version(torch.__version__) < parse_version('1.0.1'):
         print("\nNOTICE:")
-        print("The Distiller \'master\' branch now requires at least PyTorch version 0.4.0 due to "
+        print("The Distiller \'master\' branch now requires at least PyTorch version 1.0.1 due to "
               "PyTorch API changes which are not backward-compatible.\n"
-              "Please install PyTorch 0.4.0 or its derivative.\n"
+              "Please install PyTorch 1.0.1 or its derivative.\n"
               "If you are using a virtual environment, do not forget to update it:\n"
               "  1. Deactivate the old environment\n"
               "  2. Install the new environment\n"
