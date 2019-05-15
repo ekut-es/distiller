@@ -16,7 +16,15 @@
 
 import logging
 import torch
-import distiller
+import os
+import sys
+try:
+    import distiller
+except ImportError:
+    module_path = os.path.abspath(os.path.join('..'))
+    if module_path not in sys.path:
+        sys.path.append(module_path)
+    import distiller
 import common  # common test code
 
 # Logging configuration

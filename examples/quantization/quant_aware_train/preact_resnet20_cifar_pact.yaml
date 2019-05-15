@@ -22,26 +22,26 @@ quantizers:
     act_clip_init_val: 8.0
     bits_activations: 4
     bits_weights: 3
-    overrides:
+    bits_overrides:
     # Don't quantize first and last layers
       conv1:
-        bits_weights: null
-        bits_activations: null
+        wts: null
+        acts: null
       layer1.0.pre_relu:
-        bits_weights: null
-        bits_activations: null
+        wts: null
+        acts: null
       final_relu:
-        bits_weights: null
-        bits_activations: null
+        wts: null
+        acts: null
       fc:
-        bits_weights: null
-        bits_activations: null
+        wts: null
+        acts: null
 
 lr_schedulers:
   training_lr:
     class: MultiStepLR
     milestones: [60, 120]
-    gamma: 0.1
+    gammas: 0.1
 
 policies:
     - quantizer:

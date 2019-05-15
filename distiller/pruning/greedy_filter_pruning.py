@@ -40,9 +40,8 @@ import multiprocessing
 import csv
 import os
 import distiller
-from distiller.apputils import save_checkpoint
+from apputils import SummaryGraph, save_checkpoint
 from distiller.data_loggers import PythonLogger
-from distiller.summary_graph import SummaryGraph
 from distiller import normalize_module_name
 
 __all__ = ['add_greedy_pruner_args', 'greedy_pruner']
@@ -51,7 +50,7 @@ msglogger = logging.getLogger()
 
 def add_greedy_pruner_args(argparser, arch_choices=None, enable_pretrained=False):
     """
-    Helper function to make it easier to add command-line arguments for Greedy Pruning
+    Helper function to make it easier to add command-line arguments for Greedy Prunign
     to any application.
 
     Arguments:
@@ -222,7 +221,6 @@ def record_network_details(fields):
         writer.writerow(fields)
 
 
-# This is a temporary hack!
 resnet50_params = ["module.layer1.0.conv1.weight", "module.layer1.0.conv2.weight",
                    "module.layer1.1.conv1.weight", "module.layer1.1.conv2.weight",
                    "module.layer1.2.conv1.weight", "module.layer1.2.conv2.weight",
@@ -240,21 +238,19 @@ resnet50_params = ["module.layer1.0.conv1.weight", "module.layer1.0.conv2.weight
                    "module.layer4.1.conv1.weight", "module.layer4.1.conv2.weight",
                    "module.layer4.2.conv1.weight", "module.layer4.2.conv2.weight"]
 
-resnet20_params = ["module.layer1.0.conv1.weight", "module.layer1.1.conv1.weight", "module.layer1.2.conv1.weight",
-                   "module.layer2.0.conv1.weight", "module.layer2.1.conv1.weight", "module.layer2.2.conv1.weight",
-                   "module.layer3.0.conv1.weight", "module.layer3.1.conv1.weight", "module.layer3.2.conv1.weight"]
+resnet20_params = ["module.layer1.0.conv1.weight", "module.layer2.0.conv1.weight", "module.layer3.0.conv1.weight",
+                   "module.layer1.1.conv1.weight", "module.layer2.1.conv1.weight", "module.layer3.1.conv1.weight",
+                   "module.layer1.2.conv1.weight", "module.layer2.2.conv1.weight", "module.layer3.2.conv1.weight"]
 
-resnet56_params = ["module.layer1.0.conv1.weight", "module.layer1.1.conv1.weight", "module.layer1.2.conv1.weight",
-                   "module.layer1.3.conv1.weight", "module.layer1.4.conv1.weight", "module.layer1.5.conv1.weight",
-                   "module.layer1.6.conv1.weight", "module.layer1.7.conv1.weight", "module.layer1.8.conv1.weight",
-
-                   "module.layer2.0.conv1.weight", "module.layer2.1.conv1.weight", "module.layer2.2.conv1.weight",
-                   "module.layer2.3.conv1.weight", "module.layer2.4.conv1.weight", "module.layer2.5.conv1.weight",
-                   "module.layer2.6.conv1.weight", "module.layer2.7.conv1.weight", "module.layer2.8.conv1.weight",
-
-                   "module.layer3.0.conv1.weight", "module.layer3.1.conv1.weight", "module.layer3.2.conv1.weight",
-                   "module.layer3.3.conv1.weight", "module.layer3.4.conv1.weight", "module.layer3.5.conv1.weight",
-                   "module.layer3.6.conv1.weight", "module.layer3.7.conv1.weight", "module.layer3.8.conv1.weight"]
+resnet56_params = [ "module.layer1.0.conv1.weight", "module.layer2.0.conv1.weight", "module.layer3.0.conv1.weight",
+                    "module.layer1.1.conv1.weight", "module.layer2.1.conv1.weight", "module.layer3.1.conv1.weight",
+                    "module.layer1.2.conv1.weight", "module.layer2.2.conv1.weight", "module.layer3.2.conv1.weight",
+                    "module.layer1.3.conv1.weight", "module.layer2.3.conv1.weight", "module.layer3.3.conv1.weight",
+                    "module.layer1.4.conv1.weight", "module.layer2.4.conv1.weight", "module.layer3.4.conv1.weight",
+                    "module.layer1.5.conv1.weight", "module.layer2.5.conv1.weight", "module.layer3.5.conv1.weight",
+                    "module.layer1.6.conv1.weight", "module.layer2.6.conv1.weight", "module.layer3.6.conv1.weight",
+                    "module.layer1.7.conv1.weight", "module.layer2.7.conv1.weight", "module.layer3.7.conv1.weight",
+                    "module.layer1.8.conv1.weight", "module.layer2.8.conv1.weight", "module.layer3.8.conv1.weight"]
 
 
 def greedy_pruner(pruned_model, app_args, fraction_to_prune, pruning_step, test_fn, train_fn):
@@ -296,7 +292,7 @@ def greedy_pruner(pruned_model, app_args, fraction_to_prune, pruning_step, test_
         results = (iteration, prec1, param_name, compute_density, total_macs, densities)
         record_network_details(results)
         scheduler = create_scheduler(pruned_model, zeros_mask_dict)
-        save_checkpoint(0, arch, pruned_model, optimizer=None, scheduler=scheduler, extras={'top1': prec1},
+        save_checkpoint(0, arch, pruned_model, optimizer=None, best_top1=prec1, scheduler=scheduler,
                         name="greedy__{}__{:.1f}__{:.1f}".format(str(iteration).zfill(3), compute_density*100, prec1),
                         dir=msglogger.logdir)
         del scheduler
@@ -307,6 +303,6 @@ def greedy_pruner(pruned_model, app_args, fraction_to_prune, pruning_step, test_
     prec1, prec5, loss = test_fn(model=pruned_model)
     print(prec1, prec5, loss)
     scheduler = create_scheduler(pruned_model, zeros_mask_dict)
-    save_checkpoint(0, arch, pruned_model, optimizer=None, scheduler=scheduler, extras={'top1': prec1},
+    save_checkpoint(0, arch, pruned_model, optimizer=None, best_top1=prec1, scheduler=scheduler,
                     name='_'.join(("greedy", str(fraction_to_prune))),
                     dir=msglogger.logdir)

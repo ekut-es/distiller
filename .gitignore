@@ -1,28 +1,13 @@
-# Runs / tests collaterals
-latest_log_dir
-latest_log_file
-logs/
 *.log
-*.tar
 *.pyc
 __pycache__/
 .pytest_cache
 .cache
-
-# Virtual env
+*.tar
+site/
 env/
 .env/
-
-# IDEs
 .idea/
-.vscode/
-
-# OS X
+logs/
 .DS_Store
-._.DS_Store
-
-# PIP
-distiller.egg-info/
-
-# Jupyter
-.ipynb_checkpoints/
+.vscode/

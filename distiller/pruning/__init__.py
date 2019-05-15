@@ -25,8 +25,7 @@ from .automated_gradual_pruner import AutomatedGradualPruner, \
                                       ActivationAPoZRankedFilterPruner_AGP, \
                                       ActivationMeanRankedFilterPruner_AGP, \
                                       GradientRankedFilterPruner_AGP, \
-                                      RandomRankedFilterPruner_AGP, \
-                                      BernoulliFilterPruner_AGP
+                                      RandomRankedFilterPruner_AGP
 from .level_pruner import SparsityLevelParameterPruner
 from .sensitivity_pruner import SensitivityPruner
 from .splicing_pruner import SplicingPruner
@@ -35,10 +34,8 @@ from .ranked_structures_pruner import L1RankedStructureParameterPruner, \
                                       L2RankedStructureParameterPruner, \
                                       ActivationAPoZRankedFilterPruner, \
                                       ActivationMeanRankedFilterPruner, \
-                                      GradientRankedFilterPruner,       \
-                                      RandomRankedFilterPruner,         \
-                                      RandomLevelStructureParameterPruner, \
-                                      BernoulliFilterPruner
+                                      GradientRankedFilterPruner, \
+                                      RandomRankedFilterPruner
 from .baidu_rnn_pruner import BaiduRNNPruner
 from .greedy_filter_pruning import greedy_pruner
 
