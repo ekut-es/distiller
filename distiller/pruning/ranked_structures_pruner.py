@@ -128,15 +128,8 @@ class LpRankedStructureParameterPruner(RankedStructureParameterPruner):
     def rank_and_prune_channels(fraction_to_prune, param, param_name=None,
                                 zeros_mask_dict=None, model=None, binary_map=None, magnitude_fn=l1_magnitude):
         def rank_channels(fraction_to_prune, param):
-            
-            for item in param.size():
-                print(item)
-                
-                
             num_filters = param.size(0)
             num_channels = param.size(1)
-            
-            
             kernel_size = param.size(2) * param.size(3)
 
             # First, reshape the weights tensor such that each channel (kernel) in the original
