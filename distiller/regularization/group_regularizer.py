@@ -30,12 +30,12 @@ group and individual feature levels"
 
 
 [1] Yuan, M.; Lin, Y. (2006). "Model selection and estimation in regression with grouped variables".
-    J. R. Stat. Soc. B. 68 (1): 49–67. doi:10.1111/j.1467-9868.2005.00532.x
+    J. R. Stat. Soc. B. 68 (1): 49â€“67. doi:10.1111/j.1467-9868.2005.00532.x
 
 [2] Jenatton, Rodolphe; Audibert, Jean-Yves; Bach, Francis (2009). "Structured Variable Selection with
-    Sparsity-Inducing Norms". Journal of Machine Learning Research. 12 (2011): 2777–2824. arXiv:0904.3523
+    Sparsity-Inducing Norms". Journal of Machine Learning Research. 12 (2011): 2777â€“2824. arXiv:0904.3523
 
-[3] J. Friedman, T. Hastie, and R. Tibshirani, “A note on the group lasso and a sparse group lasso,”
+[3] J. Friedman, T. Hastie, and R. Tibshirani, â€œA note on the group lasso and a sparse group lasso,â€�
     arXiv preprint arXiv:1001.0736, 2010
 """
 
@@ -59,6 +59,8 @@ class GroupLassoRegularizer(distiller.GroupThresholdMixin, _Regularizer):
             strength = self.reg_regims[param_name][0]
             if group_type == '2D':
                 regularizer_loss += GroupLassoRegularizer.__2d_kernelwise_reg(param, strength)
+            elif group_type == '1D':
+                regularizer_loss += GroupLassoRegularizer.__1d_kernelwise_reg(param, strength)
             elif group_type == 'Rows':
                 regularizer_loss += GroupLassoRegularizer.__2d_rowwise_reg(param, strength)
             elif group_type == 'Cols':
@@ -173,15 +175,25 @@ class GroupLassoRegularizer(distiller.GroupThresholdMixin, _Regularizer):
         assert layer_weights.dim() == 4, "This regularization is only supported for 4D weights"
         view_2d = layer_weights.view(-1, layer_weights.size(2) * layer_weights.size(3))
         return GroupLassoRegularizer.__grouplasso_reg(view_2d, strength, dim=1)
-
+    
+    @staticmethod
+    def __1d_kernelwise_reg(layer_weights, strength):
+        """Group Lasso with one of:
+            - group = 1D weights kernel (convolution)
+            - group = 1D columns (fully connected)
+            - group = 1D rows (fully connected)
+        """
+        assert layer_weights.dim() == 3, "This regularization is only supported for 3D weights"
+        view_1d = layer_weights.view(-1, layer_weights.size(1) * layer_weights.size(2))
+        return GroupLassoRegularizer.__grouplasso_reg(view_1d, strength, dim=1)
 
 class GroupVarianceRegularizer(GroupLassoRegularizer):
     """Group variance regularization.
 
     As described in [4].
 
-    [4] Amirsina Torfi, Rouzbeh A. Shirvani, Sobhan Soleymani, Nasser M. Nasrabadi,
-        “Attention-Based Guided Structured Sparsity of Deep Neural Networks,”
+    [4] Amirsina Torfi,Â Rouzbeh A. Shirvani,Â Sobhan Soleymani,Â Nasser M. Nasrabadi,
+        â€œAttention-Based Guided Structured Sparsity of Deep Neural Networks,â€�
         arXiv preprint arXiv:1802.09902, ICLR 2018
     """
     def __init__(self, name, model, reg_regims):
