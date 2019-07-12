@@ -26,6 +26,8 @@ import torch
 from torchnet.meter import AverageValueMeter
 import logging
 from math import sqrt
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import distiller
 msglogger = logging.getLogger()
@@ -94,9 +96,10 @@ class ActivationStatsCollector(object):
 
         Eligible modules are currently filtered by their class type.
         """
-        is_leaf_node = len(list(module.children())) == 0
+        if distiller.has_children(module) or isinstance(module, torch.nn.Identity):
+            return
         register_all_class_types = not self.classes
-        if is_leaf_node and (register_all_class_types or (type(module) in self.classes)):
+        if register_all_class_types or isinstance(module, tuple(self.classes)):
             self.fwd_hook_handles.append(module.register_forward_hook(self._activation_stats_cb))
             self._start_counter(module)
 
@@ -144,7 +147,9 @@ class SummaryActivationStatsCollector(ActivationStatsCollector):
     light-weight and quicker than collecting a record per activation.
     The statistic function is configured in the constructor.
     """
-    def __init__(self, model, stat_name, summary_fn, classes=[torch.nn.ReLU]):
+    def __init__(self, model, stat_name, summary_fn, classes=[torch.nn.ReLU,
+                                                              torch.nn.ReLU6,
+                                                              torch.nn.LeakyReLU]):
         super(SummaryActivationStatsCollector, self).__init__(model, stat_name, classes)
         self.summary_fn = summary_fn
 
@@ -221,7 +226,9 @@ class RecordsActivationStatsCollector(ActivationStatsCollector):
 
     For obvious reasons, this is slower than SummaryActivationStatsCollector.
     """
-    def __init__(self, model, classes=[torch.nn.ReLU]):
+    def __init__(self, model, classes=[torch.nn.ReLU,
+                                       torch.nn.ReLU6,
+                                       torch.nn.LeakyReLU]):
         super(RecordsActivationStatsCollector, self).__init__(model, "statistics_records", classes)
 
     def _activation_stats_cb(self, module, input, output):
@@ -440,9 +447,10 @@ class QuantCalibrationStatsCollector(ActivationStatsCollector):
             for i in range(len(inputs)):
                 module.quant_stats.inputs.append(_QuantStatsRecord.create_records_dict())
 
-        for idx, input in enumerate(inputs):
-            update_record(module.quant_stats.inputs[idx], input)
-        update_record(module.quant_stats.output, output)
+        with torch.no_grad():
+            for idx, input in enumerate(inputs):
+                update_record(module.quant_stats.inputs[idx], input)
+            update_record(module.quant_stats.output, output)
 
     def _start_counter(self, module):
         # We don't know the number of inputs at this stage so we defer records creation to the actual callback
@@ -451,8 +459,9 @@ class QuantCalibrationStatsCollector(ActivationStatsCollector):
 
     def _reset_counter(self, module):
         # We don't know the number of inputs at this stage so we defer records creation to the actual callback
-        module.quant_stats = _QuantStatsRecord()
-        module.batch_idx = 0
+        if hasattr(module, 'quant_stats'):
+            module.quant_stats = _QuantStatsRecord()
+            module.batch_idx = 0
 
     def _collect_activations_stats(self, module, activation_stats, name=''):
         if distiller.utils.has_children(module):
@@ -468,10 +477,6 @@ class QuantCalibrationStatsCollector(ActivationStatsCollector):
         activation_stats[module.distiller_name]['output'] = module.quant_stats.output
 
     def save(self, fname):
-        def ordered_dict_representer(self, value):
-            return self.represent_mapping('tag:yaml.org,2002:map', value.items())
-        yaml.add_representer(OrderedDict, ordered_dict_representer)
-
         if not fname.endswith('.yaml'):
             fname = ".".join([fname, 'yaml'])
         try:
@@ -480,8 +485,7 @@ class QuantCalibrationStatsCollector(ActivationStatsCollector):
             pass
 
         records_dict = self.value()
-        with open(fname, 'w') as f:
-            yaml.dump(records_dict, f, default_flow_style=False)
+        distiller.yaml_ordered_save(fname, records_dict)
 
         return fname
 
@@ -547,18 +551,22 @@ class ActivationHistogramsCollector(ActivationStatsCollector):
 
     def _activation_stats_cb(self, module, inputs, output):
         def get_hist(t, stat_min, stat_max):
+            # torch.histc doesn't work on integral data types, so convert if needed
+            if t.dtype not in [torch.float, torch.double, torch.half]:
+                t = t.float()
             t_clamped = t.clamp(stat_min, stat_max)
             hist = torch.histc(t_clamped.cpu(), bins=self.nbins, min=stat_min, max=stat_max)
             return hist
 
-        for idx, input in enumerate(inputs):
-            stat_min, stat_max = self._get_min_max(module.distiller_name, 'inputs', idx)
-            curr_hist = get_hist(input, stat_min, stat_max)
-            module.input_hists[idx] += curr_hist
+        with torch.no_grad():
+            for idx, input in enumerate(inputs):
+                stat_min, stat_max = self._get_min_max(module.distiller_name, 'inputs', idx)
+                curr_hist = get_hist(input, stat_min, stat_max)
+                module.input_hists[idx] += curr_hist
 
-        stat_min, stat_max = self._get_min_max(module.distiller_name, 'output')
-        curr_hist = get_hist(output, stat_min, stat_max)
-        module.output_hist += curr_hist
+            stat_min, stat_max = self._get_min_max(module.distiller_name, 'output')
+            curr_hist = get_hist(output, stat_min, stat_max)
+            module.output_hist += curr_hist
 
     def _reset(self, module):
         num_inputs = len(self.act_stats[module.distiller_name]['inputs'])

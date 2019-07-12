@@ -29,8 +29,8 @@ For each epoch:
     compression_scheduler.on_epoch_begin(epoch)
     train()
     validate()
-    save_checkpoint()
     compression_scheduler.on_epoch_end(epoch)
+    save_checkpoint()
 
 train():
     For each training step:
@@ -93,28 +93,31 @@ def main():
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-    msglogger = apputils.config_pylogger(os.path.join(script_dir, 'logging.conf'), args.name, args.output_dir)
+    msglogger = apputils.config_pylogger(os.path.join(script_dir, 'logging.conf'), args.name, args.output_dir,
+                                         args.verbose)
 
     # Log various details about the execution environment.  It is sometimes useful
     # to refer to past experiment executions and this information may be useful.
-    apputils.log_execution_env_state(args.compress, msglogger.logdir, gitroot=module_path)
+    apputils.log_execution_env_state(
+        filter(None, [args.compress, args.qe_stats_file]),  # remove both None and empty strings
+        msglogger.logdir, gitroot=module_path)
     msglogger.debug("Distiller: %s", distiller.__version__)
-
-    start_epoch = 0
-    ending_epoch = args.epochs
-    perf_scores_history = []
 
     if args.evaluate:
         args.deterministic = True
     if args.deterministic:
-        # Experiment reproducibility is sometimes important.  Pete Warden expounded about this
-        # in his blog: https://petewarden.com/2018/03/19/the-machine-learning-reproducibility-crisis/
-        distiller.set_deterministic()  # Use a well-known seed, for repeatability of experiments
+        distiller.set_deterministic(args.seed) # For experiment reproducability
     else:
+        if args.seed is not None:
+            distiller.set_seed(args.seed)
         # Turn on CUDNN benchmark mode for best performance. This is usually "safe" for image
         # classification models, as the input sizes don't change during the run
         # See here: https://discuss.pytorch.org/t/what-does-torch-backends-cudnn-benchmark-do/5936/3
         cudnn.benchmark = True
+
+    start_epoch = 0
+    ending_epoch = args.epochs
+    perf_scores_history = []
 
     if args.cpu or not torch.cuda.is_available():
         # Set GPU index to -1 if using CPU
@@ -136,8 +139,8 @@ def main():
             torch.cuda.set_device(args.gpus[0])
 
     # Infer the dataset from the model name
-    args.dataset = 'cifar10' if 'cifar' in args.arch else 'imagenet'
-    args.num_classes = 10 if args.dataset == 'cifar10' else 1000
+    args.dataset = distiller.apputils.classification_dataset_str_from_arch(args.arch)
+    args.num_classes = distiller.apputils.classification_num_classes(args.dataset)
 
     if args.earlyexit_thresholds:
         args.num_exits = len(args.earlyexit_thresholds) + 1
@@ -196,7 +199,14 @@ def main():
 
     # This sample application can be invoked to produce various summary reports.
     if args.summary:
-        return summarize_model(model, args.dataset, which_summary=args.summary)
+        for summary in args.summary:
+            distiller.model_summary(model, summary, args.dataset)
+        return
+
+    if args.export_onnx is not None:
+        return distiller.export_img_classifier_to_onnx(model,
+            os.path.join(msglogger.logdir, args.export_onnx),
+            args.dataset, add_softmax=True, verbose=False)
 
     if args.qe_calibration:
         return acts_quant_stats_collection(model, criterion, pylogger, args)
@@ -268,8 +278,7 @@ def main():
         # This is the main training loop.
         msglogger.info('\n')
         if compression_scheduler:
-            compression_scheduler.on_epoch_begin(epoch,
-                metrics=(vloss if (epoch != start_epoch) else 10**6))
+            compression_scheduler.on_epoch_begin(epoch)
 
         # Train for one epoch
         with collectors_context(activations_collectors["train"]) as collectors:
@@ -296,7 +305,7 @@ def main():
                                         loggers=[tflogger])
 
         if compression_scheduler:
-            compression_scheduler.on_epoch_end(epoch, optimizer)
+            compression_scheduler.on_epoch_end(epoch, optimizer, metrics={'min': vloss, 'max': top1})
 
         # Update the list of top scores achieved so far, and save the checkpoint
         update_training_scores_history(perf_scores_history, model, top1, top5, epoch, args.num_best_scores)
@@ -630,7 +639,7 @@ def evaluate_model(model, criterion, test_loader, loggers, activations_collector
     if args.quantize_eval:
         model.cpu()
         quantizer = quantization.PostTrainLinearQuantizer.from_args(model, args)
-        quantizer.prepare_model()
+        quantizer.prepare_model(distiller.get_dummy_input(input_shape=model.input_shape))
         model.to(args.device)
 
     top1, _, _ = test(test_loader, model, criterion, loggers, activations_collectors, args=args)
@@ -640,15 +649,6 @@ def evaluate_model(model, criterion, test_loader, loggers, activations_collector
         apputils.save_checkpoint(0, args.arch, model, optimizer=None, scheduler=scheduler,
                                  name='_'.join([args.name, checkpoint_name]) if args.name else checkpoint_name,
                                  dir=msglogger.logdir, extras={'quantized_top1': top1})
-
-
-def summarize_model(model, dataset, which_summary):
-    if which_summary.startswith('png'):
-        model_summaries.draw_img_classifier_to_file(model, 'model.png', dataset, which_summary == 'png_w_params')
-    elif which_summary == 'onnx':
-        model_summaries.export_img_classifier_to_onnx(model, 'model.onnx', dataset)
-    else:
-        distiller.model_summary(model, which_summary, dataset)
 
 
 def sensitivity_analysis(model, criterion, data_loader, loggers, args, sparsities):
@@ -666,8 +666,8 @@ def sensitivity_analysis(model, criterion, data_loader, loggers, args, sparsitie
                                                          sparsities=sparsities,
                                                          test_func=test_fnc,
                                                          group=args.sensitivity)
-    distiller.sensitivities_to_png(sensitivity, 'sensitivity.png')
-    distiller.sensitivities_to_csv(sensitivity, 'sensitivity.csv')
+    distiller.sensitivities_to_png(sensitivity, os.path.join(msglogger.logdir, 'sensitivity.png'))
+    distiller.sensitivities_to_csv(sensitivity, os.path.join(msglogger.logdir, 'sensitivity.csv'))
 
 
 def automated_deep_compression(model, criterion, optimizer, loggers, args):
@@ -774,23 +774,8 @@ def save_collectors_data(collectors, directory):
         msglogger.info("Saved to {}".format(file_path))
 
 
-def check_pytorch_version():
-    from pkg_resources import parse_version
-    if parse_version(torch.__version__) < parse_version('1.0.1'):
-        print("\nNOTICE:")
-        print("The Distiller \'master\' branch now requires at least PyTorch version 1.0.1 due to "
-              "PyTorch API changes which are not backward-compatible.\n"
-              "Please install PyTorch 1.0.1 or its derivative.\n"
-              "If you are using a virtual environment, do not forget to update it:\n"
-              "  1. Deactivate the old environment\n"
-              "  2. Install the new environment\n"
-              "  3. Activate the new environment")
-        exit(1)
-
-
 if __name__ == '__main__':
     try:
-        check_pytorch_version()
         main()
     except KeyboardInterrupt:
         print("\n-- KeyboardInterrupt --")
