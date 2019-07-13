@@ -163,7 +163,7 @@ class LpRankedStructureParameterPruner(RankedStructureParameterPruner):
             # tensor, is now a row in the 2D tensor.
 #             view_2d = param.view(-1, kernel_size)
             view_1d = param.view(-1, kernel_size)
-            print(view_1d)
+#             print(view_1d)
             
             # Next, compute the sums of each kernel
 #             kernel_mags = magnitude_fn(view_2d, dim=1)
