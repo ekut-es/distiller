@@ -127,24 +127,47 @@ class LpRankedStructureParameterPruner(RankedStructureParameterPruner):
     @staticmethod
     def rank_and_prune_channels(fraction_to_prune, param, param_name=None,
                                 zeros_mask_dict=None, model=None, binary_map=None, magnitude_fn=l1_magnitude):
+        
         def rank_channels(fraction_to_prune, param):
+                           
+            '''
+            for layers.1.convs.0.weight in tc-res8:
             
+            with ...
             
             for item in param:
                 print(item)
                 
+            ... returns 24 tensor objects, each with 16 rows in 1 column
+                
+    
+            and
+            
             for item in param.size():
                 print(item)
             
+            param.size(0) <- 24
+            param.size(1) <- 16
+            param.size(2) <- 1
+            
+            ! there is no param.size(3)
+            '''
+            
+            
             num_filters = param.size(0)
             num_channels = param.size(1)
-            kernel_size = param.size(2) * param.size(3)
+#             kernel_size = param.size(2) * param.size(3)
+            kernel_size = param.size(2)
 
             # First, reshape the weights tensor such that each channel (kernel) in the original
             # tensor, is now a row in the 2D tensor.
-            view_2d = param.view(-1, kernel_size)
+#             view_2d = param.view(-1, kernel_size)
+            view_1d = param.view(-1, kernel_size)
+            print(view_1d)
+            
             # Next, compute the sums of each kernel
-            kernel_mags = magnitude_fn(view_2d, dim=1)
+#             kernel_mags = magnitude_fn(view_2d, dim=1)
+            kernel_mags = magnitude_fn(view_1d, dim=1)
             # Now group by channels
             k_sums_mat = kernel_mags.view(num_filters, num_channels).t()
             channel_mags = k_sums_mat.mean(dim=1)
