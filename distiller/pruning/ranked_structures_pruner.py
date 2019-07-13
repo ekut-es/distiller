@@ -129,7 +129,11 @@ class LpRankedStructureParameterPruner(RankedStructureParameterPruner):
                                 zeros_mask_dict=None, model=None, binary_map=None, magnitude_fn=l1_magnitude):
         def rank_channels(fraction_to_prune, param):
             
+            
             for item in param:
+                print(item)
+                
+            for item in param.size():
                 print(item)
             
             num_filters = param.size(0)
