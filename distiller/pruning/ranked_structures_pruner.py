@@ -210,7 +210,7 @@ class LpRankedStructureParameterPruner(RankedStructureParameterPruner):
     @staticmethod
     def rank_and_prune_filters(fraction_to_prune, param, param_name,
                                zeros_mask_dict, model=None, binary_map=None, magnitude_fn=l1_magnitude):
-        assert param.dim() == 4, "This pruning is only supported for 4D weights"
+#         assert param.dim() == 4, "This pruning is only supported for 4D weights"
 
         threshold = None
         threshold_type = 'L1' if magnitude_fn == l1_magnitude else 'L2'
