@@ -41,7 +41,6 @@ class ParameterMasker(object):
 
     def apply_mask(self, parameter):
         """Apply a mask on the weights tensor (parameter)."""
-
         if self.mask is None:
             msglogger.debug('No mask for parameter {0}'.format(self.param_name))
             return
@@ -54,7 +53,7 @@ class ParameterMasker(object):
 
     def mask_tensor(self, tensor):
         if self.mask is not None:
-            print(tensor.data)
+            print (self.mask)
             tensor.data.mul_(self.mask)
 
     def mask_gradient(self, gradient):
