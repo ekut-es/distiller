@@ -423,12 +423,12 @@ def rnn_model_stats(rnn_model):
         (None, ClipMode.AVG, 0),
 
         (distiller.utils.yaml_ordered_load("""
-        rnn.cell_0.eltwisemult_hidden:
+        rnn.cells.0.eltwisemult_hidden:
             clip_acts: NONE
         """), ClipMode.NONE, 0),
 
         (distiller.utils.yaml_ordered_load("""
-        rnn.cell_0.eltwisemult_hidden:
+        rnn.cells.0.eltwisemult_hidden:
             clip_acts: N_STD
             clip_n_stds: 2
         """), ClipMode.N_STD, 2)
@@ -600,9 +600,9 @@ class LinearBNSplitAct(nn.Module):
         super(LinearBNSplitAct, self).__init__()
         self.linear = nn.Linear(10, 40)
         self.bn = nn.BatchNorm1d(40)
-        acts_map = {'relu': nn.ReLU(), 'tanh': nn.Tanh(), 'sigmoid': nn.Sigmoid()}
-        self.act1 = acts_map[act1_type]
-        self.act2 = acts_map[act2_type]
+        acts_map = {'relu': nn.ReLU, 'tanh': nn.Tanh, 'sigmoid': nn.Sigmoid}
+        self.act1 = acts_map[act1_type]()
+        self.act2 = acts_map[act2_type]()
 
     def forward(self, x):
         x = self.linear(x)
