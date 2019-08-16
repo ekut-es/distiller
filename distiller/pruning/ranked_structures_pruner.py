@@ -156,18 +156,18 @@ class LpRankedStructureParameterPruner(RankedStructureParameterPruner):
             
             num_filters = param.size(0)
             num_channels = param.size(1)
-#             kernel_size = param.size(2) * param.size(3)
-            kernel_size = param.size(2)
+            kernel_size = param.size(2) * param.size(3)
+#             kernel_size = param.size(2)
 
             # First, reshape the weights tensor such that each channel (kernel) in the original
             # tensor, is now a row in the 2D tensor.
-#             view_2d = param.view(-1, kernel_size)
-            view_1d = param.view(-1, kernel_size)
+            view_2d = param.view(-1, kernel_size)
+#             view_1d = param.view(-1, kernel_size)
 #             print(view_1d)
             
             # Next, compute the sums of each kernel
-#             kernel_mags = magnitude_fn(view_2d, dim=1)
-            kernel_mags = magnitude_fn(view_1d, dim=1)
+            kernel_mags = magnitude_fn(view_2d, dim=1)
+#             kernel_mags = magnitude_fn(view_1d, dim=1)
             # Now group by channels
             k_sums_mat = kernel_mags.view(num_filters, num_channels).t()
             channel_mags = k_sums_mat.mean(dim=1)
