@@ -54,7 +54,9 @@ class ParameterMasker(object):
     def mask_tensor(self, tensor):
         if self.mask is not None:
             print(self.mask.size())
+            print(self.mask)
             print(tensor.size())
+            print(tensor)
             tensor.data.mul_(self.mask)
 
     def mask_gradient(self, gradient):
