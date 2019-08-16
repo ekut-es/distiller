@@ -337,19 +337,7 @@ class SummaryGraph(object):
                         group = op['attrs']['group']
                     else:
                         kernel_size, group = 1, 1
-<<<<<<< HEAD
-                    try:
-                        n_ifm = self.param_shape(conv_in)[1] / group
-                    except IndexError:
-                        # Todo: change the method for calculating MACs
-                        msglogger.error("An input to a Convolutional layer is missing shape information "
-                                        "(footprint values will be wrong)")
-                        msglogger.error("For details see https://github.com/NervanaSystems/distiller/issues/168")
-                        n_ifm = 1
-                        
-=======
                     n_ifm = self.param_shape(conv_in)[1]
->>>>>>> upstream/master
                     n_ofm = self.param_shape(conv_out)[1] 
                     weights_vol = kernel_size * n_ifm * n_ofm / group
                     op['attrs']['n_ifm'] = n_ifm
