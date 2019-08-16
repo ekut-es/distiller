@@ -60,6 +60,8 @@ def group_threshold_binary_map(param, group_type, threshold, threshold_criteria)
           'Max' thresholds the entire group using the magnitude of the largest
           element in the group.
     """
+    print("!!!!  group_threshold_binary_map !!!!")
+    
     if group_type == '2D':
         assert param.dim() == 4, "This thresholding is only supported for 4D weights"
         view_2d = param.view(-1, param.size(2) * param.size(3))
@@ -132,7 +134,7 @@ def group_threshold_mask(param, group_type, threshold, threshold_criteria, binar
           element in the group.
     """
     
-    print("!!!!  Hello !!!!")
+    print("!!!!  group_threshold_mask !!!!")
     if group_type == '2D':
         if binary_map is None:
             binary_map = group_threshold_binary_map(param, group_type, threshold, threshold_criteria)
