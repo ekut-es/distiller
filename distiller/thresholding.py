@@ -131,6 +131,8 @@ def group_threshold_mask(param, group_type, threshold, threshold_criteria, binar
           'Max' thresholds the entire group using the magnitude of the largest
           element in the group.
     """
+    
+    print("!!!!  Hello !!!!")
     if group_type == '2D':
         if binary_map is None:
             binary_map = group_threshold_binary_map(param, group_type, threshold, threshold_criteria)
@@ -176,7 +178,6 @@ def group_threshold_mask(param, group_type, threshold, threshold_criteria, binar
 
         # Now let's expand back up to a 4D mask
         a = binary_map.expand(num_filters, num_kernels_per_filter)
-        print("i was here")
         c = a.unsqueeze(-1)
         d = c.expand(num_filters, num_kernels_per_filter, param.size(2) * param.size(3)).contiguous()
         return d.view(param.size(0), param.size(1), param.size(2), param.size(3)), binary_map
