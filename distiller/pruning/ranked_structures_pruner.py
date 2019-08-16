@@ -151,10 +151,17 @@ class LpRankedStructureParameterPruner(_RankedStructureParameterPruner):
         assert len(param.shape) == 4
         num_filters, num_channels = param.size(0), param.size(1)
         kernel_size = param.size(2) * param.size(3)
+        
+        """ for Conv1d replace following 3 lines """ 
+#         kernel_size = param.size(2)
+#         view_1d = param.view(-1, kernel_size)
+#         kernel_mags = magnitude_fn(view_1d, dim=1)
+
 
         # First, reshape the weights tensor such that each channel (kernel) in the original
         # tensor, is now a row in the 2D tensor.
         view_2d = param.view(-1, kernel_size)
+        
         # Next, compute the sums of each kernel
         kernel_mags = magnitude_fn(view_2d, dim=1)
         # Now group by channels
