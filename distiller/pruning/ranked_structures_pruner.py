@@ -216,7 +216,10 @@ class LpRankedStructureParameterPruner(_RankedStructureParameterPruner):
         """ for Conv1d """ 
         if len(param.shape) == 3:
             d = c.expand(num_filters, num_channels, param.size(2)).contiguous()
-            return d.view(num_filters, num_channels, param.size(2))        
+            print(num_filters)
+            print(num_channels)
+            print(param.size(2))
+            return d.view(num_filters, num_channels, param.size(2))    
         else: 
             """ for Conv2d """ 
             d = c.expand(num_filters, num_channels, param.size(2) * param.size(3)).contiguous()
@@ -234,6 +237,7 @@ class LpRankedStructureParameterPruner(_RankedStructureParameterPruner):
                 magnitude_fn, fraction_to_prune, param, group_size, rounding_fn, noise)
             if bottomk_channels is None:
                 # Empty list means that fraction_to_prune is too low to prune anything
+                msglogger.info("%sRankedStructureParameterPruner - param: %s : fraction_to_prune is too low to prune anything", threshold_type, param_name)
                 return
             threshold = bottomk_channels[-1]
             binary_map = channel_mags.gt(threshold).type(param.data.type())
