@@ -211,7 +211,13 @@ class LpRankedStructureParameterPruner(_RankedStructureParameterPruner):
         num_filters, num_channels = param.size(0), param.size(1)
         a = binary_map.expand(num_filters, num_channels)
         c = a.unsqueeze(-1)
-        d = c.expand(num_filters, num_channels, param.size(2) * param.size(3)).contiguous()
+        
+        if len(param.shape) == 3:
+            d = c.expand(num_filters, num_channels, param.size(2)).contiguous()
+        else: 
+            d = c.expand(num_filters, num_channels, param.size(2) * param.size(3)).contiguous()
+        
+        
         return d.view(num_filters, num_channels, param.size(2), param.size(3))
 
     @staticmethod
