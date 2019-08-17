@@ -148,8 +148,8 @@ class LpRankedStructureParameterPruner(_RankedStructureParameterPruner):
 
     @staticmethod
     def rank_channels(magnitude_fn, fraction_to_prune, param, group_size, rounding_fn, noise):
-        print(len(param.shape))
-        assert len(param.shape) == 4
+        print(param)
+        assert len(param.shape) == 4 or len(param.shape) == 3 
         num_filters, num_channels = param.size(0), param.size(1)
 #         kernel_size = param.size(2) * param.size(3)
         
@@ -157,7 +157,6 @@ class LpRankedStructureParameterPruner(_RankedStructureParameterPruner):
         kernel_size = param.size(2)
         view_1d = param.view(-1, kernel_size)
         kernel_mags = magnitude_fn(view_1d, dim=1)
-
 
         # First, reshape the weights tensor such that each channel (kernel) in the original
         # tensor, is now a row in the 2D tensor.
