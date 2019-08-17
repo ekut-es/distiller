@@ -214,11 +214,12 @@ class LpRankedStructureParameterPruner(_RankedStructureParameterPruner):
         
         if len(param.shape) == 3:
             d = c.expand(num_filters, num_channels, param.size(2)).contiguous()
+            return d.view(num_filters, num_channels, param.size(2))
         else: 
             d = c.expand(num_filters, num_channels, param.size(2) * param.size(3)).contiguous()
+            return d.view(num_filters, num_channels, param.size(2), param.size(3))
         
         
-        return d.view(num_filters, num_channels, param.size(2), param.size(3))
 
     @staticmethod
     def rank_and_prune_channels(fraction_to_prune, param, param_name=None, zeros_mask_dict=None, 
