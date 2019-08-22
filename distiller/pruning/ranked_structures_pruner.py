@@ -155,18 +155,15 @@ class LpRankedStructureParameterPruner(_RankedStructureParameterPruner):
 
         """ for Conv1d """ 
         if len(param.shape) == 3:
-            """
-            for item in param:
-                returns 24 tensors, each with 16 rows in 1 column
-                
-            param.size(0) <- 24
-            param.size(1) <- 16
-            param.size(2) <- 1
-            ! there is no param.size(3)
+            """    
+            param.size(0) <- filters?
+            param.size(1) <- channels?
+            param.size(2) <- kernelsize?
+            ! there is no param.size(3) because no 4th dimension in Conv1d (only 3 dimensions)
             """
             kernel_size = param.size(2)
-            view_1d = param.view(-1, kernel_size)
-            kernel_mags = magnitude_fn(view_1d, dim=1)
+            view_2d = param.view(-1, kernel_size)
+            kernel_mags = magnitude_fn(view_2d, dim=1)
         else:
             """ for Conv2d """
             kernel_size = param.size(2) * param.size(3)
