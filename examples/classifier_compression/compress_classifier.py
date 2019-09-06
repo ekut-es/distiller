@@ -51,6 +51,8 @@ models, or with the provided sample models:
 - MobileNet for ImageNet: https://github.com/marvis/pytorch-mobilenet
 """
 
+import sys
+sys.path.append("../../../distiller")
 import traceback
 import logging
 from functools import partial
