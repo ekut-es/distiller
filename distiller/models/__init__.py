@@ -15,8 +15,7 @@
 #
 
 """This package contains ImageNet and CIFAR image classification models for pytorch"""
-import sys
-sys.path.append("../../../distiller")
+
 import copy
 
 import torch
