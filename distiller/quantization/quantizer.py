@@ -334,4 +334,4 @@ class Quantizer(object):
             if self.train_with_fp_copy:
                 setattr(ptq.module, ptq.q_attr_name, q_param)
             else:
-                getattr(ptq.module, ptq.q_attr_name).data = q_param.data
+                getattr(ptq.module, ptq.q_attr_name).data = q_param.data
