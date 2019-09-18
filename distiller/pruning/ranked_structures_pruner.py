@@ -844,4 +844,4 @@ class FMReconstructionChannelPruner(_RankedStructureParameterPruner):
                            param_name,
                            distiller.sparsity_ch(zeros_mask_dict[param_name].mask),
                            fraction_to_prune, binary_map.sum().item(), param.size(1))
-        return binary_map
+        return binary_map
