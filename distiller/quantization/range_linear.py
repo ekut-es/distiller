@@ -985,6 +985,7 @@ class QuantAwareTrainRangeLinearQuantizer(Quantizer):
 
         self.activation_replace_fn = activation_replace_fn
         self.replacement_factory[nn.ReLU] = self.activation_replace_fn
+        self.replacement_factory[nn.Hardtanh] = self.activation_replace_fn
 
     def _prepare_model_impl(self):
         super(QuantAwareTrainRangeLinearQuantizer, self)._prepare_model_impl()
