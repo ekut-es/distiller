@@ -73,7 +73,7 @@ def main():
     app = ClassifierCompressorSampleApp(args, script_dir=os.path.dirname(__file__))
     if app.handle_subapps():
         return
-    init_knowledge_distillation(app.args,  app.model, app.compression_scheduler)
+    init_knowledge_distillation(app.args, app.model, app.compression_scheduler)
     app.run_training_loop()
     # Finally run results on the test set
     return app.test()
@@ -98,26 +98,24 @@ def handle_subapps(model, criterion, optimizer, compression_scheduler, pylogger,
                                                 os.path.join(msglogger.logdir, args.export_onnx),
                                                 args.dataset, add_softmax=True, verbose=False)
         do_exit = True
-    elif args.qe_calibration:
-        classifier.acts_quant_stats_collection(model, criterion, pylogger, args)
+    elif args.qe_calibration and not (args.evaluate and args.quantize_eval):
+        classifier.acts_quant_stats_collection(model, criterion, pylogger, args, save_to_file=True)
         do_exit = True
     elif args.activation_histograms:
         classifier.acts_histogram_collection(model, criterion, pylogger, args)
         do_exit = True
     elif args.sensitivity is not None:
         test_loader = load_test_data(args)
-        #sensitivities = np.arange(args.sensitivity_range[0], args.sensitivity_range[1], args.sensitivity_range[2])
         sensitivities = np.arange(*args.sensitivity_range)
         sensitivity_analysis(model, criterion, test_loader, pylogger, args, sensitivities)
         do_exit = True
     elif args.evaluate:
         test_loader = load_test_data(args)
-        activations_collectors = classifier.create_activation_stats_collectors(model, *args.activation_stats)
-        classifier.evaluate_model(model, criterion, test_loader, pylogger, activations_collectors,
-                                  args, compression_scheduler)
+        classifier.evaluate_model(test_loader, model, criterion, pylogger,
+            classifier.create_activation_stats_collectors(model, *args.activation_stats),
+            args, scheduler=compression_scheduler)
         do_exit = True
     elif args.thinnify:
-        #zeros_mask_dict = distiller.create_model_masks_dict(model)
         assert args.resumed_checkpoint_path is not None, \
             "You must use --resume-from to provide a checkpoint file to thinnify"
         distiller.contract_model(model, compression_scheduler.zeros_mask_dict, args.arch, args.dataset, optimizer=None)
@@ -160,7 +158,7 @@ def early_exit_init(args):
 class ClassifierCompressorSampleApp(classifier.ClassifierCompressor):
     def __init__(self, args, script_dir):
         super().__init__(args, script_dir)
-        early_exit_init(args)
+        early_exit_init(self.args)
         # Save the randomly-initialized model before training (useful for lottery-ticket method)
         if args.save_untrained_model:
             ckpt_name = '_'.join((self.args.name or "", "untrained"))

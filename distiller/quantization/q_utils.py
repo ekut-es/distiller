@@ -18,6 +18,12 @@ from enum import Enum
 import torch
 
 
+class LinearQuantMode(Enum):
+    SYMMETRIC = 1
+    ASYMMETRIC_UNSIGNED = 2
+    ASYMMETRIC_SIGNED = 3
+
+
 def _prep_saturation_val_tensor(sat_val):
     is_scalar = not isinstance(sat_val, torch.Tensor)
     out = torch.tensor(sat_val) if is_scalar else sat_val.clone().detach()
@@ -230,7 +236,9 @@ class AciqSymmetricClipper(AciqClipper):
             mean = torch.tensor(t['mean'])
         else:
             mean = t.mean()
-        return torch.abs(mean) + alpha
+
+        clip_val = torch.abs(mean) + alpha
+        return -clip_val, clip_val
 
 
 class AciqAsymmetricClipper(AciqClipper):
@@ -249,8 +257,8 @@ class AciqAsymmetricClipper(AciqClipper):
         else:
             alpha = AciqClipper.get_alpha_gauss(t, across_dim, self.num_bits, half_range=half_range)
         min_val = torch.max(min_val, mean - alpha)
-
-        return min_val, min_val + 2 * alpha
+        delta = alpha if half_range else 2 * alpha
+        return min_val, min_val + delta
 
 
 def get_quantized_range(num_bits, signed=True):

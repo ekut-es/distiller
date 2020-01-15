@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2018 Intel Corporation
+# Copyright (c) 2019 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 # limitations under the License.
 #
 
+import copy
 import math
 import time
 import os
@@ -27,16 +28,15 @@ import torch.backends.cudnn as cudnn
 import torch.optim
 import torch.utils.data
 import torchnet.meter as tnt
+import parser
+from functools import partial
+import argparse
 import distiller
 import distiller.apputils as apputils
 from distiller.data_loggers import *
 import distiller.quantization as quantization
 import distiller.models as models
 from distiller.models import create_model
-import parser
-from functools import partial
-import operator
-import argparse
 from distiller.utils import float_range_argparse_checker as float_range
 
 # Logger handle
@@ -54,23 +54,28 @@ class ClassifierCompressor(object):
         - Classifier training, verification and testing
     """
     def __init__(self, args, script_dir):
-        self.args = args
-        _infer_implicit_args(args)
-        self.logdir = _init_logger(args, script_dir)
-        _config_determinism(args)
-        _config_compute_device(args)
+        self.args = copy.deepcopy(args)
+        self._infer_implicit_args(self.args)
+        self.logdir = _init_logger(self.args, script_dir)
+        _config_determinism(self.args)
+        _config_compute_device(self.args)
         
         # Create a couple of logging backends.  TensorBoardLogger writes log files in a format
         # that can be read by Google's Tensor Board.  PythonLogger writes to the Python logger.
-        self.tflogger = TensorBoardLogger(msglogger.logdir)
-        self.pylogger = PythonLogger(msglogger)
+        if not self.logdir:
+            self.pylogger = self.tflogger = NullLogger()
+        else:
+            self.tflogger = TensorBoardLogger(msglogger.logdir)
+            self.pylogger = PythonLogger(msglogger)
         (self.model, self.compression_scheduler, self.optimizer, 
-             self.start_epoch, self.ending_epoch) = _init_learner(args)
+             self.start_epoch, self.ending_epoch) = _init_learner(self.args)
 
         # Define loss function (criterion)
-        self.criterion = nn.CrossEntropyLoss().to(args.device)
+        self.criterion = nn.CrossEntropyLoss().to(self.args.device)
         self.train_loader, self.val_loader, self.test_loader = (None, None, None)
-        self.activations_collectors = create_activation_stats_collectors(self.model, *args.activation_stats)
+        self.activations_collectors = create_activation_stats_collectors(
+            self.model, *self.args.activation_stats)
+        self.performance_tracker = apputils.SparsityAccuracyTracker(self.args.num_best_scores)
     
     def load_datasets(self):
         """Load the datasets"""
@@ -82,6 +87,25 @@ class ClassifierCompressor(object):
     def data_loaders(self):
         return self.train_loader, self.val_loader, self.test_loader
 
+    @staticmethod
+    def _infer_implicit_args(args):
+        # Infer the dataset from the model name
+        if not hasattr(args, 'dataset'):
+            args.dataset = distiller.apputils.classification_dataset_str_from_arch(args.arch)
+        if not hasattr(args, "num_classes"):
+            args.num_classes = distiller.apputils.classification_num_classes(args.dataset)
+        return args
+
+    @staticmethod
+    def mock_args():
+        """Generate a Namespace based on default arguments"""
+        return ClassifierCompressor._infer_implicit_args(
+            init_classifier_compression_arg_parser().parse_args(['fictive_required_arg',]))
+
+    @classmethod
+    def mock_classifier(cls):
+        return cls(cls.mock_args(), '')
+
     def train_one_epoch(self, epoch, verbose=True):
         """Train for one epoch"""
         self.load_datasets()
@@ -92,7 +116,7 @@ class ClassifierCompressor(object):
                                      loggers=[self.tflogger, self.pylogger], args=self.args)
             if verbose:
                 distiller.log_weights_sparsity(self.model, epoch, [self.tflogger, self.pylogger])
-            distiller.log_activation_statsitics(epoch, "train", loggers=[self.tflogger],
+            distiller.log_activation_statistics(epoch, "train", loggers=[self.tflogger],
                                                 collector=collectors["sparsity"])
             if self.args.masks_sparsity:
                 msglogger.info(distiller.masks_sparsity_tbl_summary(self.model, 
@@ -118,7 +142,7 @@ class ClassifierCompressor(object):
         with collectors_context(self.activations_collectors["valid"]) as collectors:
             top1, top5, vloss = validate(self.val_loader, self.model, self.criterion, 
                                          [self.pylogger], self.args, epoch)
-            distiller.log_activation_statsitics(epoch, "valid", loggers=[self.tflogger],
+            distiller.log_activation_statistics(epoch, "valid", loggers=[self.tflogger],
                                                 collector=collectors["sparsity"])
             save_collectors_data(collectors, msglogger.logdir)
 
@@ -131,18 +155,19 @@ class ClassifierCompressor(object):
                                             total_steps=1, log_freq=1, loggers=[self.tflogger])
         return top1, top5, vloss
 
-    def _finalize_epoch(self, epoch, perf_scores_history, top1, top5):
+    def _finalize_epoch(self, epoch, top1, top5):
         # Update the list of top scores achieved so far, and save the checkpoint
-        update_training_scores_history(perf_scores_history, self.model, 
-                                       top1, top5, epoch, self.args.num_best_scores)
-        is_best = epoch == perf_scores_history[0].epoch
+        self.performance_tracker.step(self.model, epoch, top1=top1, top5=top5)
+        _log_best_scores(self.performance_tracker, msglogger)
+        best_score = self.performance_tracker.best_scores()[0]
+        is_best = epoch == best_score.epoch
         checkpoint_extras = {'current_top1': top1,
-                             'best_top1': perf_scores_history[0].top1,
-                             'best_epoch': perf_scores_history[0].epoch}
-        apputils.save_checkpoint(epoch, self.args.arch, self.model, optimizer=self.optimizer, 
-                                 scheduler=self.compression_scheduler, extras=checkpoint_extras, 
-                                 is_best=is_best, name=self.args.name, dir=msglogger.logdir)
-
+                             'best_top1': best_score.top1,
+                             'best_epoch': best_score.epoch}
+        if msglogger.logdir:
+            apputils.save_checkpoint(epoch, self.args.arch, self.model, optimizer=self.optimizer,
+                                     scheduler=self.compression_scheduler, extras=checkpoint_extras,
+                                     is_best=is_best, name=self.args.name, dir=msglogger.logdir)
 
     def run_training_loop(self):
         """Run the main training loop with compression.
@@ -161,11 +186,12 @@ class ClassifierCompressor(object):
         # Load the datasets lazily
         self.load_datasets()
 
-        perf_scores_history = []       
+        self.performance_tracker.reset()
         for epoch in range(self.start_epoch, self.ending_epoch):
             msglogger.info('\n')
             top1, top5, loss = self.train_validate_with_scheduling(epoch)
-            self._finalize_epoch(epoch, perf_scores_history, top1, top5)
+            self._finalize_epoch(epoch, top1, top5)
+        return self.performance_tracker.perf_scores_history
 
     def validate(self, epoch=-1):
         self.load_datasets()
@@ -252,8 +278,6 @@ def init_classifier_compression_arg_parser():
                         help='an optional parameter for sensitivity testing '
                              'providing the range of sparsities to test.\n'
                              'This is equivalent to creating sensitivities = np.arange(start, stop, step)')
-    parser.add_argument('--extras', default=None, type=str,
-                        help='file with extra configuration information')
     parser.add_argument('--deterministic', '--det', action='store_true',
                         help='Ensure deterministic execution for re-producible results.')
     parser.add_argument('--seed', type=int, default=None,
@@ -293,9 +317,10 @@ def init_classifier_compression_arg_parser():
 
 
 def _init_logger(args, script_dir):
-    module_path = os.path.abspath(os.path.join(script_dir, '..', '..'))
     global msglogger
-
+    if script_dir is None or not hasattr(args, "output_dir") or args.output_dir is None:
+        msglogger.logdir = None
+        return None
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
     msglogger = apputils.config_pylogger(os.path.join(script_dir, 'logging.conf'),
@@ -305,9 +330,10 @@ def _init_logger(args, script_dir):
     # to refer to past experiment executions and this information may be useful.
     apputils.log_execution_env_state(
         filter(None, [args.compress, args.qe_stats_file]),  # remove both None and empty strings
-        msglogger.logdir, gitroot=module_path)
+        msglogger.logdir)
     msglogger.debug("Distiller: %s", distiller.__version__)
     return msglogger.logdir
+
 
 def _config_determinism(args):
     if args.evaluate:
@@ -330,6 +356,7 @@ def _config_determinism(args):
         cudnn.benchmark = True
     msglogger.info("Random seed: %d", args.seed)
 
+
 def _config_compute_device(args):
     if args.cpu or not torch.cuda.is_available():
         # Set GPU index to -1 if using CPU
@@ -349,14 +376,6 @@ def _config_compute_device(args):
                                      .format(dev_id, available_gpus))
             # Set default device in case the first one on the list != 0
             torch.cuda.set_device(args.gpus[0])
-
-
-def _infer_implicit_args(args):
-    # Infer the dataset from the model name
-    if not hasattr(args, 'dataset'):
-        args.dataset = distiller.apputils.classification_dataset_str_from_arch(args.arch)
-    if not hasattr(args, "num_classes"):
-        args.num_classes = distiller.apputils.classification_num_classes(args.dataset)
 
 
 def _init_learner(args):
@@ -424,8 +443,8 @@ def create_activation_stats_collectors(model, *phases):
             return None  # note, does *not* set self[key] - we don't want defaultdict's behavior
 
     genCollectors = lambda: missingdict({
-        "sparsity":      SummaryActivationStatsCollector(model, "sparsity",
-                                                         lambda t: 100 * distiller.utils.sparsity(t)),
+        "sparsity_ofm":      SummaryActivationStatsCollector(model, "sparsity_ofm",
+            lambda t: 100 * distiller.utils.sparsity(t)),
         "l1_channels":   SummaryActivationStatsCollector(model, "l1_channels",
                                                          distiller.utils.activation_channels_l1),
         "apoz_channels": SummaryActivationStatsCollector(model, "apoz_channels",
@@ -494,7 +513,7 @@ def train(train_loader, model, criterion, optimizer, epoch,
             errs['Top1'] = classerr.value(1)
             errs['Top5'] = classerr.value(5)
         else:
-            # for Early Exit case, the Top1 and Top5 stats are computed for each exit.
+            # For Early Exit case, the Top1 and Top5 stats are computed for each exit.
             for exitnum in range(args.num_exits):
                 errs['Top1_exit' + str(exitnum)] = args.exiterrors[exitnum].value(1)
                 errs['Top5_exit' + str(exitnum)] = args.exiterrors[exitnum].value(5)
@@ -514,7 +533,6 @@ def train(train_loader, model, criterion, optimizer, epoch,
                                         steps_per_epoch, args.print_freq,
                                         loggers)
 
-
     OVERALL_LOSS_KEY = 'Overall Loss'
     OBJECTIVE_LOSS_KEY = 'Objective Loss'
 
@@ -525,8 +543,8 @@ def train(train_loader, model, criterion, optimizer, epoch,
     batch_time = tnt.AverageValueMeter()
     data_time = tnt.AverageValueMeter()
 
-    # For Early Exit, we define statistics for each exit
-    # So exiterrors is analogous to classerr for the non-Early Exit case
+    # For Early Exit, we define statistics for each exit, so
+    # `exiterrors` is analogous to `classerr` in the non-Early Exit case
     if early_exit_mode(args):
         args.exiterrors = []
         for exitnum in range(args.num_exits):
@@ -558,10 +576,11 @@ def train(train_loader, model, criterion, optimizer, epoch,
         if not early_exit_mode(args):
             loss = criterion(output, target)
             # Measure accuracy
-            classerr.add(output.data, target)
+            classerr.add(output.detach(), target)
             acc_stats.append([classerr.value(1), classerr.value(5)])
         else:
             # Measure accuracy and record loss
+            classerr.add(output[args.num_exits-1].detach(), target) # add the last exit (original exit)
             loss = earlyexit_loss(output, target, criterion, args)
         # Record loss
         losses[OBJECTIVE_LOSS_KEY].add(loss.item())
@@ -612,14 +631,17 @@ def validate(val_loader, model, criterion, loggers, args, epoch=-1):
     return _validate(val_loader, model, criterion, loggers, args, epoch)
 
 
-def test(test_loader, model, criterion, loggers, activations_collectors, args):
+def test(test_loader, model, criterion, loggers=None, activations_collectors=None, args=None):
     """Model Test"""
     msglogger.info('--- test ---------------------')
+    if args is None:
+        args = ClassifierCompressor.mock_args()
     if activations_collectors is None:
         activations_collectors = create_activation_stats_collectors(model, None)
+
     with collectors_context(activations_collectors["test"]) as collectors:
         top1, top5, lossses = _validate(test_loader, model, criterion, loggers, args)
-        distiller.log_activation_statsitics(-1, "test", loggers, collector=collectors['sparsity'])
+        distiller.log_activation_statistics(-1, "test", loggers, collector=collectors['sparsity'])
         save_collectors_data(collectors, msglogger.logdir)
     return top1, top5, lossses
 
@@ -637,7 +659,6 @@ def _validate(data_loader, model, criterion, loggers, args, epoch=-1):
                                       ('Top5', classerr.value(5))])
         else:
             stats_dict = OrderedDict()
-            stats_dict['Test'] = validation_step
             for exitnum in range(args.num_exits):
                 la_string = 'LossAvg' + str(exitnum)
                 stats_dict[la_string] = args.losses_exits[exitnum].mean
@@ -689,9 +710,9 @@ def _validate(data_loader, model, criterion, loggers, args, epoch=-1):
                 loss = criterion(output, target)
                 # measure accuracy and record loss
                 losses['objective_loss'].add(loss.item())
-                classerr.add(output.data, target)
+                classerr.add(output.detach(), target)
                 if args.display_confusion:
-                    confusion.add(output.data, target)
+                    confusion.add(output.detach(), target)
             else:
                 earlyexit_validate_loss(output, target, criterion, args)
 
@@ -715,40 +736,33 @@ def _validate(data_loader, model, criterion, loggers, args, epoch=-1):
         return total_top1, total_top5, losses_exits_stats[args.num_exits-1]
 
 
-def update_training_scores_history(perf_scores_history, model, top1, top5, epoch, num_best_scores):
-    """ Update the list of top training scores achieved so far, and log the best scores so far"""
-
-    model_sparsity, _, params_nnz_cnt = distiller.model_params_stats(model)
-    perf_scores_history.append(distiller.MutableNamedTuple({'params_nnz_cnt': -params_nnz_cnt,
-                                                            'sparsity': model_sparsity,
-                                                            'top1': top1, 'top5': top5, 'epoch': epoch}))
-    # Keep perf_scores_history sorted from best to worst
-    # Sort by sparsity as main sort key, then sort by top1, top5 and epoch
-    perf_scores_history.sort(key=operator.attrgetter('params_nnz_cnt', 'top1', 'top5', 'epoch'), reverse=True)
-    for score in perf_scores_history[:num_best_scores]:
-        msglogger.info('==> Best [Top1: %.3f   Top5: %.3f   Sparsity:%.2f   Params: %d on epoch: %d]',
-                       score.top1, score.top5, score.sparsity, -score.params_nnz_cnt, score.epoch)
-
-
 def earlyexit_loss(output, target, criterion, args):
-    loss = 0
-    sum_lossweights = 0
+    """Compute the weighted sum of the exits losses
+
+    Note that the last exit is the original exit of the model (i.e. the
+    exit that traverses the entire network.
+    """
+    weighted_loss = 0
+    sum_lossweights = sum(args.earlyexit_lossweights)
+    assert sum_lossweights < 1
     for exitnum in range(args.num_exits-1):
-        loss += (args.earlyexit_lossweights[exitnum] * criterion(output[exitnum], target))
-        sum_lossweights += args.earlyexit_lossweights[exitnum]
-        args.exiterrors[exitnum].add(output[exitnum].data, target)
+        if output[exitnum] is None:
+            continue
+        exit_loss = criterion(output[exitnum], target)
+        weighted_loss += args.earlyexit_lossweights[exitnum] * exit_loss
+        args.exiterrors[exitnum].add(output[exitnum].detach(), target)
     # handle final exit
-    loss += (1.0 - sum_lossweights) * criterion(output[args.num_exits-1], target)
-    args.exiterrors[args.num_exits-1].add(output[args.num_exits-1].data, target)
-    return loss
+    weighted_loss += (1.0 - sum_lossweights) * criterion(output[args.num_exits-1], target)
+    args.exiterrors[args.num_exits-1].add(output[args.num_exits-1].detach(), target)
+    return weighted_loss
 
 
 def earlyexit_validate_loss(output, target, criterion, args):
     # We need to go through each sample in the batch itself - in other words, we are
-    # not doing batch processing for exit criteria - we do this as though it were batchsize of 1
+    # not doing batch processing for exit criteria - we do this as though it were batch size of 1,
     # but with a grouping of samples equal to the batch size.
     # Note that final group might not be a full batch - so determine actual size.
-    this_batch_size = target.size()[0]
+    this_batch_size = target.size(0)
     earlyexit_validate_criterion = nn.CrossEntropyLoss(reduce=False).to(args.device)
 
     for exitnum in range(args.num_exits):
@@ -803,7 +817,7 @@ def earlyexit_validate_stats(args):
     return total_top1, total_top5, losses_exits_stats
 
 
-def evaluate_model(model, criterion, test_loader, loggers, activations_collectors, args, scheduler=None):
+def evaluate_model(test_loader, model, criterion, loggers, activations_collectors=None, args=None, scheduler=None):
     # This sample application can be invoked to evaluate the accuracy of your model on
     # the test dataset.
     # You can optionally quantize the model to 8-bit integer before evaluation.
@@ -813,30 +827,70 @@ def evaluate_model(model, criterion, test_loader, loggers, activations_collector
     if not isinstance(loggers, list):
         loggers = [loggers]
 
-    if args.quantize_eval:
-        model.cpu()
-        quantizer = quantization.PostTrainLinearQuantizer.from_args(model, args)
-        quantizer.prepare_model(distiller.get_dummy_input(input_shape=model.input_shape))
-        model.to(args.device)
+    if not args.quantize_eval:
+        return test(test_loader, model, criterion, loggers, activations_collectors, args=args)
+    else:
+        return quantize_and_test_model(test_loader, model, criterion, args, loggers,
+                                       scheduler=scheduler, save_flag=True)
 
-    top1, _, _ = test(test_loader, model, criterion, loggers, activations_collectors, args=args)
 
-    if args.quantize_eval:
+def quantize_and_test_model(test_loader, model, criterion, args, loggers=None, scheduler=None, save_flag=True):
+    """Collect stats using test_loader (when stats file is absent),
+
+    clone the model and quantize the clone, and finally, test it.
+    args.device is allowed to differ from the model's device.
+    When args.qe_calibration is set to None, uses 0.05 instead.
+
+    scheduler - pass scheduler to store it in checkpoint
+    save_flag - defaults to save both quantization statistics and checkpoint.
+    """
+    if not (args.qe_dynamic or args.qe_stats_file or args.qe_config_file):
+        args_copy = copy.deepcopy(args)
+        args_copy.qe_calibration = args.qe_calibration if args.qe_calibration is not None else 0.05
+
+        # set stats into args stats field
+        args.qe_stats_file = acts_quant_stats_collection(
+            model, criterion, loggers, args_copy, save_to_file=save_flag)
+
+    args_qe = copy.deepcopy(args)
+    if args.device == 'cpu':
+        # NOTE: Even though args.device is CPU, we allow here that model is not in CPU.
+        qe_model = distiller.make_non_parallel_copy(model).cpu()
+    else:
+        qe_model = copy.deepcopy(model).to(args.device)
+
+    quantizer = quantization.PostTrainLinearQuantizer.from_args(qe_model, args_qe)
+    quantizer.prepare_model(distiller.get_dummy_input(input_shape=model.input_shape))
+
+    test_res = test(test_loader, qe_model, criterion, loggers, args=args_qe)
+
+    if save_flag:
         checkpoint_name = 'quantized'
-        apputils.save_checkpoint(0, args.arch, model, optimizer=None, scheduler=scheduler,
-                                 name='_'.join([args.name, checkpoint_name]) if args.name else checkpoint_name,
-                                 dir=msglogger.logdir, extras={'quantized_top1': top1})
+        apputils.save_checkpoint(0, args_qe.arch, qe_model, scheduler=scheduler,
+            name='_'.join([args_qe.name, checkpoint_name]) if args_qe.name else checkpoint_name,
+            dir=msglogger.logdir, extras={'quantized_top1': test_res[0]})
 
-def acts_quant_stats_collection(model, criterion, loggers, args):
+    del qe_model
+    return test_res
+
+
+def acts_quant_stats_collection(model, criterion, loggers, args, test_loader=None, save_to_file=False):
     msglogger.info('Collecting quantization calibration stats based on {:.1%} of test dataset'
                    .format(args.qe_calibration))
-    model = distiller.utils.make_non_parallel_copy(model)
-    args.effective_test_size = args.qe_calibration
-    test_loader = load_data(args, load_train=False, load_val=False)
+    if test_loader is None:
+        tmp_args = copy.deepcopy(args)
+        tmp_args.effective_test_size = tmp_args.qe_calibration
+        # Batch size 256 causes out-of-memory errors on some models (due to extra space taken by
+        # stats calculations). Limiting to 128 for now.
+        # TODO: Come up with "smarter" limitation?
+        tmp_args.batch_size = min(128, tmp_args.batch_size)
+        test_loader = load_data(tmp_args, fixed_subset=True, load_train=False, load_val=False)
     test_fn = partial(test, test_loader=test_loader, criterion=criterion,
                       loggers=loggers, args=args, activations_collectors=None)
-    collect_quant_stats(model, test_fn, save_dir=msglogger.logdir,
-                        classes=None, inplace_runtime_check=True, disable_inplace_attrs=True)
+    with distiller.get_nonparallel_clone_model(model) as cmodel:
+        return collect_quant_stats(cmodel, test_fn, classes=None,
+                                   inplace_runtime_check=True, disable_inplace_attrs=True,
+                                   save_dir=msglogger.logdir if save_to_file else None)
 
 
 def acts_histogram_collection(model, criterion, loggers, args):
@@ -849,3 +903,18 @@ def acts_histogram_collection(model, criterion, loggers, args):
                       loggers=loggers, args=args, activations_collectors=None)
     collect_histograms(model, test_fn, save_dir=msglogger.logdir,
                        classes=None, nbins=2048, save_hist_imgs=True)
+
+
+def _log_best_scores(performance_tracker, logger, how_many=-1):
+    """Utility to log the best scores.
+
+    This function is currently written for pruning use-cases, but can be generalized.
+    """
+    assert isinstance(performance_tracker, (apputils.SparsityAccuracyTracker))
+    if how_many < 1:
+        how_many = performance_tracker.max_len
+    how_many = min(how_many, performance_tracker.max_len)
+    best_scores = performance_tracker.best_scores(how_many)
+    for score in best_scores:
+        logger.info('==> Best [Top1: %.3f   Top5: %.3f   Sparsity:%.2f   NNZ-Params: %d on epoch: %d]',
+                    score.top1, score.top5, score.sparsity, -score.params_nnz_cnt, score.epoch)

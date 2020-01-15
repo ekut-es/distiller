@@ -23,9 +23,17 @@ The sample command lines provided [below](#running-the-sample) focus on **post-t
 This task benchmarks recommendation with implicit feedback on the [MovieLens 20 Million (ml-20m) dataset](https://grouplens.org/datasets/movielens/20m/) with a [Neural Collaborative Filtering](http://dl.acm.org/citation.cfm?id=3052569) model.
 The model trains on binary information about whether or not a user interacted with a specific item.
 
-## Setup
+## Summary of Post-Training Quantization Results
 
-### Steps to configure machine
+| Precision | Mode       | Per-Channel | Split Final Layer | HR@10 |
+|-----------|------------|-------------|-------------------|-------|
+| FP32      | N/A        | N/A         | N/A               | 63.55 |
+| INT8      | Asymmetric | Yes         | No                | 49.54 |
+| INT8      | Asymmetric | Yes         | Yes               | 62.78 |
+
+Details on how to run the experiments, including what we mean by "split final layer" are [below](#running-the-sample).
+
+## Setup
 
 * Install `unzip` and `curl`
 
@@ -41,14 +49,21 @@ The model trains on binary information about whether or not a user interacted wi
   pip install -e .
   ```
 
-* Download and verify data
+* Obtain the ml-20m dataset
 
   ```bash
   cd <distiller-repo-root>/examples/ncf
+  
   # Creates ml-20.zip
-  source ../download_dataset.sh
+  source download_dataset.sh
+  
   # Confirms the MD5 checksum of ml-20.zip
-  source ../verify_dataset.sh
+  source verify_dataset.sh
+  
+  # Extracts the dataset into a sub-directory named 'ml-20m'
+  # During the last step the script might appear to hang,
+  # This is normal, it finishes after a few minutes
+  source extract_dataset.sh
   ```
 
 ## Running the Sample

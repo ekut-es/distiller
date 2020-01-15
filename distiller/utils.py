@@ -21,6 +21,7 @@ with some random helper functions.
 """
 import argparse
 from collections import OrderedDict
+import contextlib
 from copy import deepcopy
 import logging
 import operator
@@ -58,7 +59,7 @@ def to_np(var):
 def size2str(torch_size):
     if isinstance(torch_size, torch.Size):
         return size_to_str(torch_size)
-    if isinstance(torch_size, torch.FloatTensor) or isinstance(torch_size, torch.cuda.FloatTensor):
+    if isinstance(torch_size, (torch.FloatTensor, torch.cuda.FloatTensor)):
         return size_to_str(torch_size.size())
     if isinstance(torch_size, torch.autograd.Variable):
         return size_to_str(torch_size.data.size())
@@ -198,10 +199,10 @@ def sparsity_3D(tensor):
     """Filter-wise sparsity for 4D tensors"""
     if tensor.dim() != 4:
         return 0
-    view_3d = tensor.view(-1, tensor.size(1) * tensor.size(2) * tensor.size(3))
-    num_filters = view_3d.size()[0]
-    nonzero_filters = len(torch.nonzero(view_3d.abs().sum(dim=1)))
-    return 1 - nonzero_filters/num_filters
+    l1_norms = distiller.norms.filters_lp_norm(tensor, p=1, length_normalized=False)
+    num_nonzero_filters = len(torch.nonzero(l1_norms))
+    num_filters = tensor.size(0)
+    return 1 - num_nonzero_filters / num_filters
 
 
 def density_3D(tensor):
@@ -255,16 +256,8 @@ def non_zero_channels(tensor):
     if tensor.dim() != 4:
         raise ValueError("Expecting a 4D tensor")
 
-    n_filters, n_channels, k_h, k_w = (tensor.size(i) for i in range(4))
-
-    # First, reshape the weights tensor such that each channel (kernel) in
-    # the original tensor, is now a row in a 2D tensor.
-    view_2d = tensor.view(-1, k_h * k_w)
-    # Next, compute the sums of each kernel
-    kernel_sums = view_2d.abs().sum(dim=1)
-    # Now group by channels
-    k_sums_mat = kernel_sums.view(n_filters, n_channels).t()
-    nonzero_channels = torch.nonzero(k_sums_mat.abs().sum(dim=1))
+    norms = distiller.norms.channels_lp_norm(tensor, p=1)
+    nonzero_channels = torch.nonzero(norms)
     return nonzero_channels
 
 
@@ -400,15 +393,7 @@ def model_params_stats(model, param_dims=[2, 4], param_types=['weight', 'bias'])
 
 
 def norm_filters(weights, p=1):
-    """Compute the p-norm of convolution filters.
-
-    Args:
-        weights - a 4D convolution weights tensor.
-                  Has shape = (#filters, #channels, k_w, k_h)
-        p - the exponent value in the norm formulation
-    """
-    assert weights.dim() == 4
-    return weights.view(weights.size(0), -1).norm(p=p, dim=1)
+    return distiller.norms.filters_lp_norm(weights, p)
 
 
 def model_numel(model, param_dims=[2, 4], param_types=['weight', 'bias']):
@@ -528,12 +513,14 @@ def log_training_progress(stats_dict, params_dict, epoch, steps_completed, total
         logger.log_weights_distribution(params_dict, steps_completed)
 
 
-def log_activation_statsitics(epoch, phase, loggers, collector):
+def log_activation_statistics(epoch, phase, loggers, collector):
     """Log information about the sparsity of the activations"""
     if collector is None:
         return
+    if loggers is None:
+        return
     for logger in loggers:
-        logger.log_activation_statsitic(phase, collector.stat_name, collector.value(), epoch)
+        logger.log_activation_statistic(phase, collector.stat_name, collector.value(), epoch)
 
 
 def log_weights_sparsity(model, epoch, loggers):
@@ -660,6 +647,15 @@ def make_non_parallel_copy(model):
     return new_model
 
 
+@contextlib.contextmanager
+def get_nonparallel_clone_model(model):
+    clone_model = make_non_parallel_copy(model)
+    try:
+        yield clone_model
+    finally:
+        del clone_model
+
+
 def set_seed(seed):
     """Seed the PRNG for the CPU, Cuda, numpy and Python"""
     torch.manual_seed(seed)
@@ -755,3 +751,38 @@ def convert_tensors_recursively_to(val, *args, **kwargs):
 
     return val
 
+
+def model_setattr(model, attr_name, val, register=False):
+    """
+    Sets attribute of a model, through the entire hierarchy.
+    Args:
+        model (nn.Module): the model.
+        attr_name (str): the attribute name as shown by model.named_<parameters/modules/buffers>()
+        val: the value of the attribute
+        register (bool): if True - register_buffer(val) if val is a torch.Tensor and
+          register_parameter(val) if it's an nn.Parameter.
+    """
+    def split_name(name):
+        if '.' in name:
+            return name.rsplit('.', 1)
+        else:
+            return '', name
+    modules_dict = OrderedDict(model.named_modules())
+    lowest_depth_container_name, lowest_depth_attr_name = split_name(attr_name)
+    while lowest_depth_container_name and lowest_depth_container_name not in modules_dict:
+        container_name, attr = split_name(lowest_depth_container_name)
+        lowest_depth_container_name = container_name
+        lowest_depth_attr_name = '%s%s' % (attr, lowest_depth_attr_name)
+    lowest_depth_container = modules_dict[lowest_depth_container_name]  # type: nn.Module
+
+    if register and torch.is_tensor(val):
+        if isinstance(val, nn.Parameter):
+            lowest_depth_container.register_parameter(lowest_depth_attr_name, val)
+        else:
+            lowest_depth_container.register_buffer(lowest_depth_attr_name, val)
+    else:
+        setattr(lowest_depth_container, lowest_depth_attr_name, val)
+
+
+def param_name_2_module_name(param_name):
+    return '.'.join(param_name.split('.')[:-1])

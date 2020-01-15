@@ -14,9 +14,11 @@
 # limitations under the License.
 #
 
+import contextlib
 from functools import partial, reduce
 import operator
 import xlsxwriter
+import enum
 import yaml
 import os
 from sys import float_info
@@ -30,12 +32,23 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import distiller
+from distiller.quantization.range_linear import is_post_train_quant_wrapper
+import numpy as np
+
 msglogger = logging.getLogger()
 
 __all__ = ['SummaryActivationStatsCollector', 'RecordsActivationStatsCollector',
            'QuantCalibrationStatsCollector', 'ActivationHistogramsCollector',
+           'CollectorDirection',
            'collect_quant_stats', 'collect_histograms',
            'collector_context', 'collectors_context']
+
+class CollectorDirection(enum.Enum):
+    OUT = 0
+    OFM = 0
+    IN = 1
+    IFM = 1
+    IFMS = 1
 
 
 class ActivationStatsCollector(object):
@@ -76,30 +89,40 @@ class ActivationStatsCollector(object):
         # a unique, human-readable name per layer.
         distiller.utils.assign_layer_fq_names(model)
 
+        # Currently this is internal, and its only purpose is to enable skipping collection
+        # for wrapped modules inside post-training quantization wrapper classes.
+        # When doing PTQ, the outputs of these wrapped modules are actually intermediate results
+        # which are not relevant for tracking.
+        self._dont_collect_list = [module.wrapped_module.distiller_name for module in model.modules() if
+                                   is_post_train_quant_wrapper(module)]
+
     def value(self):
         """Return a dictionary containing {layer_name: statistic}"""
         activation_stats = OrderedDict()
         self.model.apply(partial(self._collect_activations_stats, activation_stats=activation_stats))
         return activation_stats
 
-    def start(self):
+    def start(self, modules_list=None):
         """Start collecting activation stats.
 
         This will iteratively register the modules' forward-hooks, so that the collector
         will be called from the forward traversal and get exposed to activation data.
+        modules_list (iterable): track stats for modules in the list. If None/empty - will track for all modules.
         """
         assert len(self.fwd_hook_handles) == 0
-        self.model.apply(self.start_module)
+        if not modules_list:
+            self.model.apply(self.start_module)
+            return
+        modules_dict = dict(self.model.named_modules())
+        for module_name in modules_list:
+            modules_dict[module_name].apply(self.start_module)
 
     def start_module(self, module):
         """Iteratively register to the forward-pass callback of all eligible modules.
 
         Eligible modules are currently filtered by their class type.
         """
-        if distiller.has_children(module) or isinstance(module, torch.nn.Identity):
-            return
-        register_all_class_types = not self.classes
-        if register_all_class_types or isinstance(module, tuple(self.classes)):
+        if self._should_collect(module):
             self.fwd_hook_handles.append(module.register_forward_hook(self._activation_stats_cb))
             self._start_counter(module)
 
@@ -120,7 +143,7 @@ class ActivationStatsCollector(object):
     def save(self, fname):
         raise NotImplementedError
 
-    def _activation_stats_cb(self, module, input, output):
+    def _activation_stats_cb(self, module, inputs, output):
         """Handle new activations ('output' argument).
 
         This is invoked from the forward-pass callback of module 'module'.
@@ -139,27 +162,76 @@ class ActivationStatsCollector(object):
         """Handle new activations - this is subclass-specific code"""
         raise NotImplementedError
 
+    def _should_collect(self, module):
+        if module.distiller_name in self._dont_collect_list:
+            return False
+        # In general, we only collect stats for "leaf" modules.
+        # We make an exception for models that were quantized with 'PostTrainLinearQuantizer'. In these
+        # models, the quantized modules are actually wrappers of the original FP32 modules, so they are
+        # NOT leaf modules - but we still want to track them.
+        if distiller.has_children(module) and not is_post_train_quant_wrapper(module):
+            return False
+        if isinstance(module, torch.nn.Identity):
+            return False
+
+        register_all_class_types = not self.classes
+        if register_all_class_types or isinstance(module, tuple(self.classes)):
+            return True
+
+        return False
+
+
+class WeightedAverageValueMeter(AverageValueMeter):
+    """
+    A correction to torchnet's AverageValueMeter which doesn't implement
+    std collection correctly by taking into account the batch size.
+    """
+    def add(self, value, n=1):
+        self.sum += value*n
+        if n <= 0:
+            raise ValueError("Cannot use a non-positive weight for the running stat.")
+        elif self.n == 0:
+            self.mean = 0.0 + value  # This is to force a copy in torch/numpy
+            self.std = np.inf
+            self.mean_old = self.mean
+            self.m_s = 0.0
+        else:
+            self.mean = self.mean_old + n * (value - self.mean_old) / float(self.n+n)
+            self.m_s += n*(value - self.mean_old) * (value - self.mean)
+            self.mean_old = self.mean
+            self.std = np.sqrt(self.m_s / (self.n + n - 1.0))
+        self.var = self.std**2
+
+        self.n += n
+
 
 class SummaryActivationStatsCollector(ActivationStatsCollector):
-    """This class collects activiations statistical summaries.
+    """This class collects activations statistical summaries.
 
     This Collector computes the mean of some statistic of the activation.  It is rather
     light-weight and quicker than collecting a record per activation.
     The statistic function is configured in the constructor.
+
+    collector_direction - enum type: IN for IFMs, OUT for OFM
+    inputs_consolidate_func is called on tuple of tensors, and returns a tensor.
     """
-    def __init__(self, model, stat_name, summary_fn, classes=[torch.nn.ReLU,
-                                                              torch.nn.ReLU6,
-                                                              torch.nn.LeakyReLU]):
+    def __init__(self, model, stat_name, summary_fn,
+                 classes=[torch.nn.ReLU, torch.nn.ReLU6, torch.nn.LeakyReLU],
+                 collector_direction=CollectorDirection.OUT,
+                 inputs_consolidate_func=torch.cat):
         super(SummaryActivationStatsCollector, self).__init__(model, stat_name, classes)
         self.summary_fn = summary_fn
+        self.collector_direction = collector_direction
+        self.inputs_func = inputs_consolidate_func
 
-    def _activation_stats_cb(self, module, input, output):
+    def _activation_stats_cb(self, module, inputs, output):
         """Record the activation sparsity of 'module'
 
         This is a callback from the forward() of 'module'.
         """
+        feature_map = output if self.collector_direction == CollectorDirection.OUT else self.inputs_func(inputs)
         try:
-            getattr(module, self.stat_name).add(self.summary_fn(output.data))
+            getattr(module, self.stat_name).add(self.summary_fn(feature_map.data), feature_map.data.numel())
         except RuntimeError as e:
             if "The expanded size of the tensor" in e.args[0]:
                 raise ValueError("ActivationStatsCollector: a module ({} - {}) was encountered twice during model.apply().\n"
@@ -175,14 +247,13 @@ class SummaryActivationStatsCollector(ActivationStatsCollector):
 
     def _start_counter(self, module):
         if not hasattr(module, self.stat_name):
-            setattr(module, self.stat_name, AverageValueMeter())
+            setattr(module, self.stat_name, WeightedAverageValueMeter())
             # Assign a name to this summary
             if hasattr(module, 'distiller_name'):
-                getattr(module, self.stat_name).name = '_'.join((self.stat_name, module.distiller_name))
+                getattr(module, self.stat_name).name = module.distiller_name
             else:
-                getattr(module, self.stat_name).name = '_'.join((self.stat_name,
-                                                                 module.__class__.__name__,
-                                                                 str(id(module))))
+                getattr(module, self.stat_name).name = '_'.join((
+                    module.__class__.__name__, str(id(module))))
 
     def _reset_counter(self, module):
         if hasattr(module, self.stat_name):
@@ -196,24 +267,29 @@ class SummaryActivationStatsCollector(ActivationStatsCollector):
             activation_stats[getattr(module, self.stat_name).name] = mean
 
     def save(self, fname):
-        """Save the records to an Excel workbook, with one worksheet per layer.
-        """
-        fname = ".".join([fname, 'xlsx'])
-        try:
+        """Save the stats to an Excel workbook"""
+        if not fname.endswith('.xlsx'):
+            fname = '.'.join([fname, 'xlsx'])
+        with contextlib.suppress(OSError):
             os.remove(fname)
-        except OSError:
-            pass
 
-        records_dict = self.value()
-        with xlsxwriter.Workbook(fname) as workbook:
-            worksheet = workbook.add_worksheet(self.stat_name)
+        def _add_worksheet(workbook, tab_name, record):
+            try:
+                worksheet = workbook.add_worksheet(tab_name)
+            except xlsxwriter.exceptions.InvalidWorksheetName:
+                worksheet = workbook.add_worksheet()
+
             col_names = []
-            for col, (module_name, module_summary_data) in enumerate(records_dict.items()):
+            for col, (module_name, module_summary_data) in enumerate(record.items()):
                 if not isinstance(module_summary_data, list):
                     module_summary_data = [module_summary_data]
                 worksheet.write_column(1, col, module_summary_data)
                 col_names.append(module_name)
             worksheet.write_row(0, 0, col_names)
+
+        with xlsxwriter.Workbook(fname) as workbook:
+            _add_worksheet(workbook, self.stat_name, self.value())
+
         return fname
 
 
@@ -231,7 +307,7 @@ class RecordsActivationStatsCollector(ActivationStatsCollector):
                                        torch.nn.LeakyReLU]):
         super(RecordsActivationStatsCollector, self).__init__(model, "statistics_records", classes)
 
-    def _activation_stats_cb(self, module, input, output):
+    def _activation_stats_cb(self, module, inputs, output):
         """Record the activation sparsity of 'module'
 
         This is a callback from the forward() of 'module'.
@@ -284,7 +360,11 @@ class RecordsActivationStatsCollector(ActivationStatsCollector):
         records_dict = self.value()
         with xlsxwriter.Workbook(fname) as workbook:
             for module_name, module_act_records in records_dict.items():
-                worksheet = workbook.add_worksheet(module_name)
+                try:
+                    worksheet = workbook.add_worksheet(module_name)
+                except xlsxwriter.exceptions.InvalidWorksheetName:
+                    worksheet = workbook.add_worksheet()
+
                 col_names = []
                 for col, (col_name, col_data) in enumerate(module_act_records.items()):
                     if col_name == 'shape':
@@ -317,6 +397,7 @@ class _QuantStatsRecord(object):
         for stat_name in ['avg_min', 'avg_max', 'mean', 'std', 'b']:
             records[stat_name] = 0
         records['shape'] = ''
+        records['total_numel'] = 0
         return records
 
     def __init__(self):
@@ -389,7 +470,7 @@ class QuantCalibrationStatsCollector(ActivationStatsCollector):
 
         self.batch_idx = 0
         self.inplace_runtime_check = inplace_runtime_check
-        self.collecting_laplace = False
+        self.collecting_second_pass = False
 
         if disable_inplace_attrs:
             if not inplace_attr_names:
@@ -404,7 +485,7 @@ class QuantCalibrationStatsCollector(ActivationStatsCollector):
         Check whether the required statistics were collected to allow collecting laplace distribution stats.
         """
         for name, module in self.model.named_modules():
-            if distiller.has_children(module) or isinstance(module, torch.nn.Identity):
+            if not self._should_collect(module):
                 continue
             if not hasattr(module, 'quant_stats'):
                 raise RuntimeError('Collection of Laplace distribution statistics is '
@@ -419,45 +500,65 @@ class QuantCalibrationStatsCollector(ActivationStatsCollector):
                                    'Please collect the required statistics using `collector.start()` and evaluating'
                                    ' the model for enough batches.' % name)
 
-    def start_laplace(self):
+    def start_second_pass(self):
         self._check_required_stats()
-        self.collecting_laplace = True
-        # reset batch_idx for all leaf modules
+        self.collecting_second_pass = True
+        # reset batch_idx for all tracked modules
         for module in self.model.modules():
-            if distiller.has_children(module) or isinstance(module, torch.nn.Identity):
+            if not self._should_collect(module):
                 continue
             module.batch_idx = 0
+            for record in module.quant_stats.inputs:
+                record['total_numel'] = 0
+            module.quant_stats.output['total_numel'] = 0
 
-    def stop_laplace(self):
-        self.collecting_laplace = False
+    def stop_second_pass(self):
+        self.collecting_second_pass = False
 
     def _activation_stats_cb(self, module, inputs, output):
-        def update_mean(old_mean, new_val):
-            return old_mean + (new_val - old_mean) / module.batch_idx
+        """
+        A callback for updating the required statistics for quantization in a module.
+        """
+        def update_running_mean(values, prev_mean, total_values_so_far):
+            """
+            Updates a running mean of a tensor of values
+            Args:
+                values (torch.Tensor): the new tensor
+                prev_mean (float): the previous running mean
+                total_values_so_far (int): the number of the values so far
+            """
+            curr_numel = values.numel()
+            prev_numel = total_values_so_far
+            return (prev_numel * prev_mean + values.sum().item()) / (prev_numel + curr_numel)
 
-        def update_std(values, old_std, old_mean, new_mean):
-            # See here:
-            # https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_Online_algorithm
-            numel = values.numel() if isinstance(values, torch.Tensor) else values.size
-            total_values_so_far = numel * (module.batch_idx - 1)
-            M = (old_std ** 2) * (total_values_so_far - 1)
-            mean_diffs = (values - old_mean) * (values - new_mean)
-            M += mean_diffs.sum()
-            return sqrt((M / (total_values_so_far + numel - 1)).item())
+        def update_std(values, prev_std, mean, total_values_so_far):
+            """
+            Updates std of the tensor
+            """
+            prev_variance = prev_std ** 2
+            curr_sqr_dists = (values - mean) ** 2
+            new_variance = update_running_mean(curr_sqr_dists, prev_variance, total_values_so_far)
+            return sqrt(new_variance)
 
-        def update_b(values, old_b, mean):
+        def update_b(values, previous_b, mean, total_values_so_far):
             """
             Updates the 'b' parameter of Laplace Distribution.
             """
-            current_b = (values - mean).abs().mean().item()
-            return old_b + (current_b - old_b) / module.batch_idx
+            curr_abs_dists = (values - mean).abs_()
+            return update_running_mean(curr_abs_dists, previous_b, total_values_so_far)
 
         def update_record(record, tensor):
+            if tensor.dtype not in [torch.float16, torch.float32, torch.float64]:
+                # Mean function only works for float tensors
+                tensor = tensor.to(torch.float32)
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
             act = tensor.view(tensor.size(0), -1)
-            if self.collecting_laplace:
-                record['b'] = update_b(act, record['b'], record['mean'])
+            numel = act.numel()
+            if self.collecting_second_pass:
+                record['b'] = update_b(act, record['b'], record['mean'], record['total_numel'])
+                record['std'] = update_std(act, record['std'], record['mean'], record['total_numel'])
+                record['total_numel'] += numel
                 return
 
             # In the general case, the average min/max that we're collecting are averages over the per-sample
@@ -466,31 +567,26 @@ class QuantCalibrationStatsCollector(ActivationStatsCollector):
             # But - If each sample contains just a single value, then such a per-sample calculation we'll result in
             # avg_min = avg_max. So in that case we "revert" to calculating "global" values, for the whole batch,
             # instead of per-sample values
-            dim = 0 if act.numel() == act.shape[0] else 1
+            dim = 0 if numel == act.shape[0] else 1
 
             min_per_sample = act.min(dim=dim)[0]
             max_per_sample = act.max(dim=dim)[0]
             record['min'] = min(record['min'], min_per_sample.min().item())
             record['max'] = max(record['max'], max_per_sample.max().item())
-            try:
-                record['avg_min'] = update_mean(record['avg_min'], min_per_sample.mean().item())
-                record['avg_max'] = update_mean(record['avg_max'], max_per_sample.mean().item())
-                new_mean = update_mean(record['mean'], act.mean().item())
-                record['std'] = update_std(tensor, record['std'], record['mean'], new_mean)
-            except RuntimeError:
-                record['avg_min'] = update_mean(record['avg_min'], min_per_sample.cpu().numpy().mean().item(0))
-                record['avg_max'] = update_mean(record['avg_max'], max_per_sample.cpu().numpy().mean().item(0))
-                new_mean = update_mean(record['mean'], act.cpu().numpy().mean().item(0))
-                record['std'] = update_std(tensor.cpu().numpy(), record['std'], record['mean'], new_mean)
+            record['avg_min'] = update_running_mean(min_per_sample, record['avg_min'], record['total_numel'])
+            record['avg_max'] = update_running_mean(max_per_sample, record['avg_max'], record['total_numel'])
+            new_mean = update_running_mean(act, record['mean'], record['total_numel'])
             record['mean'] = new_mean
+            record['total_numel'] += numel
 
             if not record['shape']:
                 record['shape'] = distiller.size2str(tensor)
 
         if self.inplace_runtime_check and any([id(input) == id(output) for input in inputs]):
-            raise RuntimeError('Inplace operation detected, meaning inputs stats are overridden by output stats. '
-                               'You can either disable this check or make sure no in-place operations occur. '
-                               'See QuantCalibrationStatsCollector class documentation for more info.')
+            if not isinstance(module, torch.nn.modules.dropout._DropoutNd):
+                raise RuntimeError('Inplace operation detected, meaning inputs stats are overridden by output stats. '
+                                   'You can either disable this check or make sure no in-place operations occur. '
+                                   'See QuantCalibrationStatsCollector class documentation for more info.')
 
         module.batch_idx += 1
 
@@ -516,8 +612,6 @@ class QuantCalibrationStatsCollector(ActivationStatsCollector):
             module.batch_idx = 0
 
     def _collect_activations_stats(self, module, activation_stats, name=''):
-        if distiller.utils.has_children(module):
-            return
         if not hasattr(module, 'quant_stats'):
             return
 
@@ -633,8 +727,6 @@ class ActivationHistogramsCollector(ActivationStatsCollector):
             self._reset(module)
 
     def _collect_activations_stats(self, module, activation_stats, name=''):
-        if distiller.utils.has_children(module):
-            return
         if not hasattr(module, 'output_hist'):
             return
 
@@ -707,7 +799,8 @@ class ActivationHistogramsCollector(ActivationStatsCollector):
 
 
 def collect_quant_stats(model, test_fn, save_dir=None, classes=None, inplace_runtime_check=False,
-                        disable_inplace_attrs=False, inplace_attr_names=('inplace',)):
+                        disable_inplace_attrs=False, inplace_attr_names=('inplace',),
+                        modules_to_collect=None):
     """
     Helper function for collecting quantization calibration statistics for a model using QuantCalibrationStatsCollector
 
@@ -722,6 +815,8 @@ def collect_quant_stats(model, test_fn, save_dir=None, classes=None, inplace_run
         inplace_runtime_check (bool): See QuantCalibrationStatsCollector
         disable_inplace_attrs (bool): See QuantCalibrationStatsCollector
         inplace_attr_names (iterable): See QuantCalibrationStatsCollector
+        modules_to_collect (iterable): enable stats collection for a predefined modules (specified by names).
+          if None - will track stats for all layers.
 
     Returns:
         Dictionary with quantization stats (see QuantCalibrationStatsCollector for a description of the dictionary
@@ -732,14 +827,14 @@ def collect_quant_stats(model, test_fn, save_dir=None, classes=None, inplace_run
                                                            inplace_runtime_check=inplace_runtime_check,
                                                            disable_inplace_attrs=disable_inplace_attrs,
                                                            inplace_attr_names=inplace_attr_names)
-    with collector_context(quant_stats_collector):
-        msglogger.info('Pass 1: Collecting min, max, avg_min, avg_max, mean, std')
+    with collector_context(quant_stats_collector, modules_to_collect):
+        msglogger.info('Pass 1: Collecting min, max, avg_min, avg_max, mean')
         test_fn(model=model)
         # Collect Laplace distribution stats:
-        msglogger.info('Pass 2: Collecting b parameter')
-        quant_stats_collector.start_laplace()
+        msglogger.info('Pass 2: Collecting b, std parameters')
+        quant_stats_collector.start_second_pass()
         test_fn(model=model)
-        quant_stats_collector.stop_laplace()
+        quant_stats_collector.stop_second_pass()
 
     msglogger.info('Stats collection complete')
     if save_dir is not None:
@@ -799,10 +894,10 @@ def collect_histograms(model, test_fn, save_dir=None, activation_stats=None,
 
 
 @contextmanager
-def collector_context(collector):
+def collector_context(collector, modules_list=None):
     """A context manager for an activation collector"""
     if collector is not None:
-        collector.reset().start()
+        collector.reset().start(modules_list)
     yield collector
     if collector is not None:
         collector.stop()
