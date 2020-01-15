@@ -213,21 +213,25 @@ class SignedFixpointQuantizer(Quantizer):
         super(SignedFixpointQuantizer, self).__init__(model, optimizer=optimizer, bits_activations=bits_activations,
                                                       bits_weights=bits_weights, bits_bias=bits_bias,
                                                       train_with_fp_copy=True, overrides=overrides)
-
+ 
         def fixpoint_quantize_param(param_fp, param_meta):
-            scale, zero_point = symmetric_linear_quantization_params(param_meta.num_bits,
-                                                                     2^(bits_weights-1))
-
+            scale =  2.0**(param_meta.num_bits - 1)  
+            zero_point = 0.0
+            
             out = param_fp.clamp(-1.0, 1.0 - (1.0 / 2.0**(bits_weights-1)))
             out = LinearQuantizeSTE.apply(out, scale, zero_point, True, False)
+
             return out
 
         def relu_replace_fn(module, name, qbits_map):
             bits_acts = qbits_map[name].acts
+
             if bits_acts is None:
                 return module
+            
             return ClippedLinearQuantization(bits_acts, 1-(1/(2**(bits_activations-1))), dequantize=True, inplace=module.inplace)
 
         self.param_quantization_fn = fixpoint_quantize_param
-
+        
         self.replacement_factory[nn.ReLU] = relu_replace_fn
+        self.replacement_factory[nn.Hardtanh] = relu_replace_fn
