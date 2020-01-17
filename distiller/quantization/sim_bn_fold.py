@@ -7,7 +7,6 @@ __all__ = ['SimulatedFoldedBatchNorm']
 
 # Number of steps before freezing the batch norm running average and variance
 FREEZE_BN_DELAY_DEFAULT = 200000
-FREEZE_BN_DELAY_DEFAULT = 1
 
 
 _conv_meta = {'conv1d': (1, F.conv1d),
