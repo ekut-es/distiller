@@ -24,7 +24,7 @@ def _broadcast_correction_factor(c, broadcast_to_shape):
 
 
 class SimulatedFoldedBatchNorm(nn.Module):
-    def __init__(self, param_module, bn, freeze_bn_delay=FREEZE_BN_DELAY_DEFAULT, param_quantization_fn=None):
+    def __init__(self, param_module, bn, freeze_bn_delay=FREEZE_BN_DELAY_DEFAULT, quantizer=None):
         """
         Wrapper for simulated folding of BatchNorm into convolution / linear layers during training
         Args:
@@ -50,8 +50,9 @@ class SimulatedFoldedBatchNorm(nn.Module):
         self.bn = bn
         self.freeze_bn_delay = freeze_bn_delay
         self.frozen = False
-        self._has_bias = (self.param_module.bias is not None)
-        self.param_quant_fn = param_quantization_fn
+        if not param_module.bias:
+            param_module.bias = nn.Parameter(torch.zeros(param_module.weight.shape[0]))
+        self.quantizer = quantizer
         if isinstance(param_module, nn.Linear):
             self.param_forward_fn = self._linear_layer_forward
             self.param_module_type = "fc"
@@ -101,7 +102,7 @@ class SimulatedFoldedBatchNorm(nn.Module):
         if not self.frozen:
             w, b, gamma, beta = self._get_all_parameters()
             if self.training:
-                batch_mean, batch_var = self.batch_stats(self.param_forward_fn(x, w), b)
+                batch_mean, batch_var = self.batch_stats(self.param_forward_fn(x, w), None)
                 recip_sigma_batch = torch.rsqrt(batch_var + self.bn.eps)
                 with torch.no_grad():
                     sigma_running = torch.sqrt(self.bn.running_var + self.bn.eps)
@@ -154,9 +155,9 @@ class SimulatedFoldedBatchNorm(nn.Module):
         """
         Quantize a parameter locally.
         """
-        if t is None or self.param_quant_fn is None:
+        if t is None or self.quantizer is None:
             return t
-        return self.param_quant_fn(t)
+        return t #self.param_quant_fn(t)
 
     def batch_stats(self, x, bias=None):
         """
@@ -229,15 +230,22 @@ class SimulatedFoldedBatchNorm(nn.Module):
 
     def freeze(self):
         w, b, gamma, beta = self._get_all_parameters()
+        w_float = getattr(self.param_module, "float_weight", None)
+        b_float = getattr(self.param_module, "float_bias", None)
         with torch.no_grad():
             recip_sigma_running = torch.rsqrt(self.bn.running_var + self.bn.eps)
-            w.mul_(self.broadcast_correction_weight(gamma * recip_sigma_running))
+            if w_float is not None:
+                w_float.mul_(self.broadcast_correction_weight(gamma * recip_sigma_running))
+            else:
+                w.mul_(self.broadcast_correction_weight(gamma * recip_sigma_running))
+            
             corrected_mean = self.bn.running_mean - (b if b is not None else 0)
             bias_corrected = beta - gamma * corrected_mean * recip_sigma_running
-            if b is not None:
-                b.copy_(bias_corrected)
+            if b_float is not None:
+                b_float.copy_(bias_corrected)
             else:
-                self.param_module.bias = nn.Parameter(bias_corrected)
+                b.copy_(bias_corrected)
+                
         self.frozen = True
 
     def _get_all_parameters(self):

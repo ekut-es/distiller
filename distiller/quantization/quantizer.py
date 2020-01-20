@@ -23,6 +23,8 @@ import torch.nn as nn
 import distiller
 import warnings
 
+from .sim_bn_fold import SimulatedFoldedBatchNorm
+
 msglogger = logging.getLogger()
 
 QBits = namedtuple('QBits', ['acts', 'wts', 'bias'])
@@ -220,24 +222,16 @@ class Quantizer(object):
         self._pre_process_container(self.model)
 
         for module_name, module in self.model.named_modules():
+            # Add link to quantizer for Simulated Folded Batch Norm
+            if isinstance(module, SimulatedFoldedBatchNorm):
+                module.quantizer = self
             qbits = self.module_qbits_map[module_name]
             if qbits.wts is None:
                 continue
 
             curr_parameters = dict(module.named_parameters())
             for param_name, param in curr_parameters.items():
-                # Bias is usually quantized according to the accumulator's number of bits
-                # Handle # of bits for bias quantization as "first-class" citizen, similarly to weights
-                n_bits = qbits.bias if param_name.endswith('bias') else qbits.wts
-                fp_attr_name = param_name
-                if self.train_with_fp_copy:
-                    hack_float_backup_parameter(module, param_name, n_bits)
-                    fp_attr_name = FP_BKP_PREFIX + param_name
-                self.params_to_quantize.append(_ParamToQuant(module, module_name, fp_attr_name, param_name, n_bits))
-
-                param_full_name = '.'.join([module_name, param_name])
-                msglogger.info(
-                    "Parameter '{0}' will be quantized to {1} bits".format(param_full_name, n_bits))
+                self._add_parameter(param_name, param, qbits, module, module_name)
 
         # If an optimizer was passed, assume we need to update it
         if self.optimizer:
@@ -245,6 +239,20 @@ class Quantizer(object):
             new_optimizer = optimizer_type(self._get_updated_optimizer_params_groups(), **self.optimizer.defaults)
             self.optimizer.__setstate__({'param_groups': new_optimizer.param_groups})
 
+    def _add_parameter(self, param_name, param, qbits, module, module_name):
+        # Bias is usually quantized according to the accumulator's number of bits
+        # Handle # of bits for bias quantization as "first-class" citizen, similarly to weights
+        n_bits = qbits.bias if param_name.endswith('bias') else qbits.wts
+        fp_attr_name = param_name
+        if self.train_with_fp_copy:
+            hack_float_backup_parameter(module, param_name, n_bits)
+            fp_attr_name = FP_BKP_PREFIX + param_name
+        self.params_to_quantize.append(_ParamToQuant(module, module_name, fp_attr_name, param_name, n_bits))
+
+        param_full_name = '.'.join([module_name, param_name])
+        msglogger.info(
+            "Parameter '{0}' will be quantized to {1} bits".format(param_full_name, n_bits))
+            
     def _pre_process_container(self, container, prefix=''):
         # Iterate through model, insert quantization functions as appropriate
         for name, module in container.named_children():
