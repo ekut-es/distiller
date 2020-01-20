@@ -157,7 +157,8 @@ class SimulatedFoldedBatchNorm(nn.Module):
         """
         if t is None or self.quantizer is None:
             return t
-        return t #self.param_quant_fn(t)
+        
+        return self.quantizer.param_quantization_fn(t, self.param_module.param_meta)
 
     def batch_stats(self, x, bias=None):
         """

@@ -225,6 +225,7 @@ class Quantizer(object):
             # Add link to quantizer for Simulated Folded Batch Norm
             if isinstance(module, SimulatedFoldedBatchNorm):
                 module.quantizer = self
+                
             qbits = self.module_qbits_map[module_name]
             if qbits.wts is None:
                 continue
@@ -247,8 +248,9 @@ class Quantizer(object):
         if self.train_with_fp_copy:
             hack_float_backup_parameter(module, param_name, n_bits)
             fp_attr_name = FP_BKP_PREFIX + param_name
-        self.params_to_quantize.append(_ParamToQuant(module, module_name, fp_attr_name, param_name, n_bits))
-
+        quantize_config = _ParamToQuant(module, module_name, fp_attr_name, param_name, n_bits)
+        self.params_to_quantize.append(quantize_config)
+        setattr(module, 'param_meta', quantize_config)
         param_full_name = '.'.join([module_name, param_name])
         msglogger.info(
             "Parameter '{0}' will be quantized to {1} bits".format(param_full_name, n_bits))
