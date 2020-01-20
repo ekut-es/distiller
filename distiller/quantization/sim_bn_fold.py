@@ -124,7 +124,7 @@ class SimulatedFoldedBatchNorm(nn.Module):
                 y = self.param_forward_fn(x, w_quantized, bias_quantized)
         else:
             w, b = self.param_module.weight, self.param_module.bias
-            w_quantized, bias_quantized = self._quant_param(w), self._quant_param(b)
+            #w_quantized, bias_quantized = self._quant_param(w), self._quant_param(b)
             y = self.param_forward_fn(x, w_quantized, bias_quantized)
 
         return y
@@ -237,6 +237,7 @@ class SimulatedFoldedBatchNorm(nn.Module):
             recip_sigma_running = torch.rsqrt(self.bn.running_var + self.bn.eps)
             if w_float is not None:
                 w_float.mul_(self.broadcast_correction_weight(gamma * recip_sigma_running))
+                w.copy_(self._quant_param(w_float))
             else:
                 w.mul_(self.broadcast_correction_weight(gamma * recip_sigma_running))
             
@@ -244,6 +245,7 @@ class SimulatedFoldedBatchNorm(nn.Module):
             bias_corrected = beta - gamma * corrected_mean * recip_sigma_running
             if b_float is not None:
                 b_float.copy_(bias_corrected)
+                b.copy_(self._quant_param(bias_corrected))
             else:
                 b.copy_(bias_corrected)
                 
