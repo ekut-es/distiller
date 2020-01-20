@@ -124,8 +124,8 @@ class SimulatedFoldedBatchNorm(nn.Module):
                 y = self.param_forward_fn(x, w_quantized, bias_quantized)
         else:
             w, b = self.param_module.weight, self.param_module.bias
-            #w_quantized, bias_quantized = self._quant_param(w), self._quant_param(b)
-            y = self.param_forward_fn(x, w_quantized, bias_quantized)
+            
+            y = self.param_forward_fn(x, w, b)
 
         return y
 
