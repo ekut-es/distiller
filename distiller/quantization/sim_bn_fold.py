@@ -109,16 +109,19 @@ class SimulatedFoldedBatchNorm(nn.Module):
                 w_corrected = w * self.broadcast_correction_weight(gamma / sigma_running)
                 w_quantized = self._quant_param(w_corrected)
                 recip_c = self.broadcast_correction(sigma_running * recip_sigma_batch)
-                bias_corrected = beta - gamma * batch_mean * recip_sigma_batch
-                bias_quantized = self.broadcast_correction(self._quant_param(bias_corrected))
+                bias_corrected = self.broadcast_correction(beta - gamma * batch_mean * recip_sigma_batch)
+                bias_quantized = self._quant_param(bias_corrected)
                 y = self.param_forward_fn(x, w_quantized, None)
                 y.mul_(recip_c).add_(bias_quantized)
+                
+
             else:
                 with torch.no_grad():
                     recip_sigma_running = torch.rsqrt(self.bn.running_var + self.bn.eps)
                 w_corrected = w * self.broadcast_correction_weight(gamma * recip_sigma_running)
                 w_quantized = self._quant_param(w_corrected)
                 corrected_mean = self.bn.running_mean - (b if b is not None else 0)
+
                 bias_corrected = beta - gamma * corrected_mean * recip_sigma_running
                 bias_quantized = self._quant_param(bias_corrected)
                 y = self.param_forward_fn(x, w_quantized, bias_quantized)
@@ -157,7 +160,6 @@ class SimulatedFoldedBatchNorm(nn.Module):
         """
         if t is None or self.quantizer is None:
             return t
-        
         return self.quantizer.param_quantization_fn(t, self.param_module.param_meta)
 
     def batch_stats(self, x, bias=None):
@@ -252,7 +254,10 @@ class SimulatedFoldedBatchNorm(nn.Module):
         self.frozen = True
 
     def _get_all_parameters(self):
-        w, b, gamma, beta = self.param_module.weight, self.param_module.bias, self.bn.weight, self.bn.bias
+        if self.quantizer:
+            w, b, gamma, beta = self.param_module.float_weight, self.param_module.float_bias, self.bn.weight, self.bn.bias
+        else:
+            w, b, gamma, beta = self.param_module.weight, self.param_module.bias, self.bn.weight, self.bn.bias
         if not self.bn.affine:
             gamma = 1.
             beta = 0.
