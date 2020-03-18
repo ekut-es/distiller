@@ -272,7 +272,7 @@ class SignedFixpointQuantizer(Quantizer):
             if bits_acts is None:
                 return module
             
-            return ClippedLinearQuantization(bits_acts, 1-(1/(2**(bits_activations-1))), dequantize=True, inplace=module.inplace)
+            return ClippedLinearQuantization(bits_acts-1, 1-(1/(2**(bits_activations-1))), dequantize=True, inplace=module.inplace)
 
         self.param_quantization_fn = fixpoint_quantize_param
         
