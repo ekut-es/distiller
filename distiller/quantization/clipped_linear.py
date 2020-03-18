@@ -75,6 +75,30 @@ class ClippedLinearQuantization(nn.Module):
                                                            inplace_str)
 
 
+class SymmetricClippedLinearQuantization(nn.Module):
+    def __init__(self, num_bits, clip_val, min_val=-1.0, dequantize=True, inplace=False):
+        super(SymmetricClippedLinearQuantization, self).__init__()
+        self.num_bits = num_bits
+        self.clip_val = clip_val
+        self.scale, self.zero_point = asymmetric_linear_quantization_params(num_bits, 0, clip_val, signed=False)
+        self.dequantize = dequantize
+        self.inplace = inplace
+        self.min_val = min_val
+
+    def forward(self, input):
+        #print("orig_input", input)
+        input = clamp(input, self.min_val, self.clip_val, self.inplace)
+        input = LinearQuantizeSTE.apply(input, self.scale, self.zero_point, self.dequantize, self.inplace)
+        #print("input:", input)
+        return input
+
+    def __repr__(self):
+        inplace_str = ', inplace' if self.inplace else ''
+        return '{0}(num_bits={1}, clip_val={2}{3} min_val={4})'.format(self.__class__.__name__, self.num_bits, self.clip_val,
+                                                                       inplace_str, self.min_val)
+
+
+
 class LearnedClippedLinearQuantization(nn.Module):
     def __init__(self, num_bits, init_act_clip_val, dequantize=True, inplace=False):
         super(LearnedClippedLinearQuantization, self).__init__()
