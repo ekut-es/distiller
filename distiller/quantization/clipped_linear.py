@@ -80,7 +80,7 @@ class SymmetricClippedLinearQuantization(nn.Module):
         super(SymmetricClippedLinearQuantization, self).__init__()
         self.num_bits = num_bits
         self.clip_val = clip_val
-        self.scale, self.zero_point = asymmetric_linear_quantization_params(num_bits, 0, clip_val, signed=False)
+        self.scale, self.zero_point = asymmetric_linear_quantization_params(num_bits, min_val, clip_val, signed=True)
         self.dequantize = dequantize
         self.inplace = inplace
         self.min_val = min_val
