@@ -38,9 +38,8 @@ del thinning
 # Distiller version
 try:
     __version__ = pkg_resources.require("distiller")[0].version
-except pkg_resources.DistributionNotFound:
+except (pkg_resources.DistributionNotFound, pkg_resources.ContextualVersionConflict):
     __version__ = "Unknown"
-
 
 def __check_pytorch_version():
     from pkg_resources import parse_version
