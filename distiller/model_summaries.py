@@ -166,13 +166,12 @@ def conv_visitor(self, input, output, df, model, memo):
     if self in memo:
         return
 
-    weights_vol = self.out_channels * self.in_channels * distiller.volume(self.kernel_size)
+    weights_vol = self.out_channels * self.in_channels / self.groups * distiller.volume(self.kernel_size)
 
     # Multiply-accumulate operations: MACs = volume(OFM) * (#IFM * K^2) / #Groups
     # Bias is ignored
     macs = (distiller.volume(output) *
             (self.in_channels / self.groups * distiller.volume(self.kernel_size)))
-    macs /= distiller.volume(self.stride)
     attrs = 'k=' + '('+(', ').join(['%d' % v for v in self.kernel_size])+')'
     attrs += ', s=' +'('+(', ').join(['%d' % v for v in self.stride])+')'
     attrs += ', g=%d' % self.groups
