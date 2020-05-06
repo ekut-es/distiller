@@ -33,6 +33,12 @@ import distiller
 from .summary_graph import SummaryGraph
 from .data_loggers import PythonLogger, CsvLogger
 
+try:
+    from speech_recognition.models.sinc import SincConv
+except:
+    SincConv = None
+
+
 msglogger = logging.getLogger()
 
 __all__ = ['model_summary',
@@ -162,11 +168,14 @@ def masks_sparsity_tbl_summary(model, scheduler, param_dims=[2, 4]):
 
 # Performance data collection  code follows from here down
 def conv_visitor(self, input, output, df, model, memo):
-    assert isinstance(self, torch.nn.Conv2d) or isinstance(self, torch.nn.Conv1d)
+    assert isinstance(self, torch.nn.Conv2d) or isinstance(self, torch.nn.Conv1d) or (SincConv is not None and isinstance(self, SincConv))
     if self in memo:
         return
 
-    weights_vol = self.out_channels * self.in_channels / self.groups * distiller.volume(self.kernel_size)
+    if SincConv is not None and isinstance(self, SincConv):
+        weights_vol = 2*self.out_channels*self.in_channels / self.groups
+    else:
+        weights_vol = self.out_channels * self.in_channels / self.groups * distiller.volume(self.kernel_size)
 
     # Multiply-accumulate operations: MACs = volume(OFM) * (#IFM * K^2) / #Groups
     # Bias is ignored
@@ -175,6 +184,7 @@ def conv_visitor(self, input, output, df, model, memo):
     attrs = 'k=' + '('+(', ').join(['%d' % v for v in self.kernel_size])+')'
     attrs += ', s=' +'('+(', ').join(['%d' % v for v in self.stride])+')'
     attrs += ', g=%d' % self.groups
+    attrs += ', d=' + '(' +', '.join(['%d' % v for v in self.dilation]) + ')'
     module_visitor(self, input, output, df, model, weights_vol, macs, attrs)
 
 
@@ -216,7 +226,7 @@ def module_visitor(self, input, output, df, model, weights_vol, macs, attrs=None
 def model_performance_summary(model, dummy_input, batch_size=1):
     """Collect performance data"""
     def install_perf_collector(m):
-        if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Conv1d):
+        if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Conv1d) or (SincConv is not None and isinstance(m, SincConv)):
             hook_handles.append(m.register_forward_hook(
                 partial(conv_visitor, df=df, model=model, memo=memo)))
         elif isinstance(m, torch.nn.Linear):
